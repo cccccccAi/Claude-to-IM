@@ -59,6 +59,24 @@ function getStreamConfig(channelType = 'telegram'): StreamConfig {
   return { intervalMs, minDeltaChars, maxChars };
 }
 
+/**
+ * Check if a message looks like a numeric permission shortcut (1/2/3) for
+ * feishu/qq channels WITH at least one pending permission in that chat.
+ *
+ * This is used by the adapter loop to route these messages to the inline
+ * (non-session-locked) path, avoiding deadlock: the session is blocked
+ * waiting for the permission to be resolved, so putting "1" behind the
+ * session lock would deadlock.
+ */
+function isNumericPermissionShortcut(channelType: string, rawText: string, chatId: string): boolean {
+  if (channelType !== 'feishu' && channelType !== 'qq') return false;
+  const normalized = rawText.normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+  if (!/^[123]$/.test(normalized)) return false;
+  const { store } = getBridgeContext();
+  const pending = store.listPendingPermissionLinksByChat(chatId);
+  return pending.length > 0; // any pending → route to inline path
+}
+
 /** Fire-and-forget: send a preview draft. Only degrades on permanent failure. */
 function flushPreview(
   adapter: BaseChannelAdapter,
@@ -366,9 +384,19 @@ function runAdapterLoop(adapter: BaseChannelAdapter): void {
         const msg = await adapter.consumeOne();
         if (!msg) continue; // Adapter stopped
 
-        // Callback queries and commands are lightweight — process inline.
+        // Callback queries, commands, and numeric permission shortcuts are
+        // lightweight — process inline (outside session lock).
         // Regular messages use per-session locking for concurrency.
-        if (msg.callbackData || msg.text.trim().startsWith('/')) {
+        //
+        // IMPORTANT: numeric shortcuts (1/2/3) for feishu/qq MUST run outside
+        // the session lock. The current session is blocked waiting for the
+        // permission to be resolved; if "1" enters the session lock queue it
+        // deadlocks (permission waits for "1", "1" waits for lock release).
+        if (
+          msg.callbackData ||
+          msg.text.trim().startsWith('/') ||
+          isNumericPermissionShortcut(adapter.channelType, msg.text.trim(), msg.address.chatId)
+        ) {
           await handleMessage(adapter, msg);
         } else {
           const binding = router.resolve(msg.address);
