@@ -327,9 +327,6 @@ function saveAliases(): void {
   }
 }
 
-// Sessions that have already received at least one response.
-// Used to show the /name hint only on the very first reply.
-const greetedSessions = new Set<string>();
 
 /**
  * Decode a Claude project directory name back to an absolute path.
@@ -953,18 +950,11 @@ async function handleMessage(
     // Send response text — render via channel-appropriate format
     if (result.responseText) {
       const alias = sessionAliases.get(binding.codepilotSessionId);
-      let responseToSend: string;
-      if (alias) {
-        // Has alias: show it at the top of every reply
-        responseToSend = `📌 ${alias}\n\n${result.responseText}`;
-      } else if (!greetedSessions.has(binding.codepilotSessionId)) {
-        // First reply in this session: append a one-time /name hint at the bottom
-        const shortId = binding.codepilotSessionId.slice(0, 8);
-        responseToSend = `${result.responseText}\n\n---\n💬 \`${shortId}\`  发送 \`/name 会话名\` 给这个会话命名，方便后续 /resume 找回`;
-      } else {
-        responseToSend = result.responseText;
-      }
-      greetedSessions.add(binding.codepilotSessionId);
+      // Show alias label at top only when user has explicitly set one via /name.
+      // No session ID is appended otherwise.
+      const responseToSend = alias
+        ? `📌 ${alias}\n\n${result.responseText}`
+        : result.responseText;
       await deliverResponse(adapter, msg.address, responseToSend, binding.codepilotSessionId, msg.messageId);
 
       // B3: Auto-detect and send files mentioned in Claude's response
