@@ -928,6 +928,16 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
   }
 
+  // ── Public accessor for file capabilities ──────────────────
+
+  /**
+   * Return the REST client for use by feishu-file-capabilities helpers.
+   * Returns null if the adapter is not started.
+   */
+  getLarkClient(): lark.Client | null {
+    return this.restClient;
+  }
+
   // ── Utilities ───────────────────────────────────────────────
 
   private addToDedup(messageId: string): void {
