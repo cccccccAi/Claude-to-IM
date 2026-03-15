@@ -218,6 +218,7 @@ export async function readFirstUserMessage(filePath: string): Promise<string> {
           }
           // Skip queue-operation entries
           if (text.startsWith('queue-operation')) continue;
+          lines.close();
           return text.slice(0, 80).replace(/\n/g, ' ').trim() || '[empty]';
         }
       } catch {
@@ -228,6 +229,7 @@ export async function readFirstUserMessage(filePath: string): Promise<string> {
   } catch {
     return '[error]';
   } finally {
+    lines.close();
     fileStream.destroy();
   }
 }
@@ -297,8 +299,33 @@ const sessionsCache = new Map<string, SessionInfo[]>();
 // Projects cache for /cwd <number> command
 let projectsCache: string[] = [];
 
-// Session aliases (sdkSessionId → user-defined name)
+// Session aliases: keyed by codepilotSessionId → user-defined name.
+// Persisted to ~/.claude-to-im/data/aliases.json for restart survival.
 const sessionAliases = new Map<string, string>();
+
+const ALIASES_FILE = path.join(os.homedir(), '.claude-to-im', 'data', 'aliases.json');
+
+function loadAliases(): void {
+  try {
+    const raw = fs.readFileSync(ALIASES_FILE, 'utf8');
+    const obj = JSON.parse(raw) as Record<string, string>;
+    for (const [k, v] of Object.entries(obj)) {
+      if (typeof k === 'string' && typeof v === 'string') {
+        sessionAliases.set(k, v);
+      }
+    }
+  } catch {
+    // File doesn't exist yet — ok
+  }
+}
+
+function saveAliases(): void {
+  try {
+    fs.writeFileSync(ALIASES_FILE, JSON.stringify(Object.fromEntries(sessionAliases), null, 2), 'utf8');
+  } catch (err) {
+    console.warn('[bridge-manager] Failed to save aliases:', err instanceof Error ? err.message : err);
+  }
+}
 
 /**
  * Decode a Claude project directory name back to an absolute path.
@@ -543,6 +570,9 @@ function processWithSessionLock(sessionId: string, fn: () => Promise<void>): Pro
 export async function start(): Promise<void> {
   const state = getState();
   if (state.running) return;
+
+  // Load persisted aliases before processing any messages
+  loadAliases();
 
   const { store, lifecycle } = getBridgeContext();
 
@@ -918,14 +948,12 @@ async function handleMessage(
 
     // Send response text — render via channel-appropriate format
     if (result.responseText) {
-      // Prepend session label (alias or short ID)
-      const sid = binding.sdkSessionId || binding.codepilotSessionId;
-      const alias = sessionAliases.get(sid);
-      const sessionLabel = alias
-        ? `📌 ${alias}`
-        : `💬 ${sid.slice(0, 8)}  \`/name 命名\``;
-      const labeledResponse = `${sessionLabel}\n\n${result.responseText}`;
-      await deliverResponse(adapter, msg.address, labeledResponse, binding.codepilotSessionId, msg.messageId);
+      // Prepend alias label only when user has set one via /name
+      const alias = sessionAliases.get(binding.codepilotSessionId);
+      const responseToSend = alias
+        ? `📌 ${alias}\n\n${result.responseText}`
+        : result.responseText;
+      await deliverResponse(adapter, msg.address, responseToSend, binding.codepilotSessionId, msg.messageId);
 
       // B3: Auto-detect and send files mentioned in Claude's response
       if (adapter.channelType === 'feishu') {
@@ -1086,13 +1114,13 @@ async function handleCommand(
 
     case '/r':
     case '/resume': {
-      if (!args) {
+      if (!args || !args.trim()) {
         response = 'Usage: /resume &lt;number|ID prefix|full ID&gt;';
         break;
       }
       const resumeBinding = router.resolve(msg.address);
       const cached = sessionsCache.get(resumeBinding.id) || null;
-      const resumeResult = resolveResumeTarget(args, cached);
+      const resumeResult = resolveResumeTarget(args.trim(), cached);
       if (resumeResult.error) {
         response = resumeResult.error;
       } else if (resumeResult.sessionId) {
@@ -1228,15 +1256,15 @@ async function handleCommand(
             `<b>📂 ${escapeHtml(workDir)} 历史会话：</b>`,
             '',
           ];
+          const activeSdkId = sessBinding.sdkSessionId;
+          const activeAlias = sessionAliases.get(sessBinding.codepilotSessionId);
           for (let i = 0; i < Math.min(sessions.length, 10); i++) {
             const s = sessions[i];
             const ago = formatTimeAgo(s.lastModified);
-            const alias = sessionAliases.get(s.id);
-            const label = alias
-              ? `<b>${escapeHtml(alias)}</b>`
-              : `"${escapeHtml(s.summary)}"`;
+            const isActive = activeSdkId && s.id === activeSdkId;
+            const activeTag = isActive ? (activeAlias ? ` 📌 ${escapeHtml(activeAlias)}` : ' ◀ 当前') : '';
             lines.push(
-              `${i + 1}. ${label} (${ago})`,
+              `${i + 1}. "${escapeHtml(s.summary)}" (${ago})${activeTag}`,
             );
           }
           lines.push('', '用 /resume &lt;序号&gt; 恢复，/name 给当前会话命名');
@@ -1354,8 +1382,8 @@ async function handleCommand(
         break;
       }
       const nameBinding = router.resolve(msg.address);
-      const sessionId = nameBinding.sdkSessionId || nameBinding.codepilotSessionId;
-      sessionAliases.set(sessionId, args.trim());
+      sessionAliases.set(nameBinding.codepilotSessionId, args.trim());
+      saveAliases();
       response = `✅ 当前会话已命名为「${escapeHtml(args.trim())}」`;
       break;
     }
