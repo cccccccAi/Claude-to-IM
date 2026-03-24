@@ -7,58 +7,63 @@
  * Uses globalThis to survive Next.js HMR in development.
  */
 
-import type { BridgeStatus, InboundMessage, OutboundMessage, StreamingPreviewState } from './types.js';
-import { createAdapter, getRegisteredTypes } from './channel-adapter.js';
-import type { BaseChannelAdapter } from './channel-adapter.js';
+import type {
+  BridgeStatus,
+  InboundMessage,
+  OutboundMessage,
+  StreamingPreviewState,
+} from "./types.js";
+import { createAdapter, getRegisteredTypes } from "./channel-adapter.js";
+import type { BaseChannelAdapter } from "./channel-adapter.js";
 // Side-effect import: triggers self-registration of all adapter factories
-import './adapters/index.js';
-import * as router from './channel-router.js';
-import * as engine from './conversation-engine.js';
-import * as broker from './permission-broker.js';
-import { deliver, deliverRendered } from './delivery-layer.js';
-import { markdownToTelegramChunks } from './markdown/telegram.js';
-import { markdownToDiscordChunks } from './markdown/discord.js';
-import { getBridgeContext } from './context.js';
-import { escapeHtml } from './adapters/telegram-utils.js';
+import "./adapters/index.js";
+import * as router from "./channel-router.js";
+import * as engine from "./conversation-engine.js";
+import * as broker from "./permission-broker.js";
+import { deliver, deliverRendered } from "./delivery-layer.js";
+import { markdownToTelegramChunks } from "./markdown/telegram.js";
+import { markdownToDiscordChunks } from "./markdown/discord.js";
+import { getBridgeContext } from "./context.js";
+import { escapeHtml } from "./adapters/telegram-utils.js";
 import {
   validateWorkingDirectory,
   validateSessionId,
   isDangerousInput,
   sanitizeInput,
   validateMode,
-} from './security/validators.js';
-import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
-import * as readline from 'readline';
-import { sendImage, sendFile } from './adapters/feishu-file-capabilities.js';
+} from "./security/validators.js";
+import * as fs from "fs";
+import * as path from "path";
+import * as os from "os";
+import * as readline from "readline";
+import { sendImage, sendFile } from "./adapters/feishu-file-capabilities.js";
 
-const GLOBAL_KEY = '__bridge_manager__';
+const GLOBAL_KEY = "__bridge_manager__";
 
 // ── B3: File path detection helpers ──────────────────────────────
 
 const FILE_EXTENSIONS =
-  '(pdf|png|jpg|jpeg|gif|xlsx|docx|pptx|html|md|csv|svg|webp)';
+  "(pdf|png|jpg|jpeg|gif|xlsx|docx|pptx|html|md|csv|svg|webp)";
 
 /** Check if a file path is safe to send (not in sensitive dirs/names). */
 export function isPathSafe(filePath: string): boolean {
   const resolved = path.resolve(filePath);
   const home = os.homedir();
   const BLOCKED_PREFIXES = [
-    path.join(home, '.ssh'),
-    path.join(home, '.aws'),
-    path.join(home, '.gnupg'),
-    path.join(home, '.kube'),
-    path.join(home, '.docker'),
-    '/etc/',
+    path.join(home, ".ssh"),
+    path.join(home, ".aws"),
+    path.join(home, ".gnupg"),
+    path.join(home, ".kube"),
+    path.join(home, ".docker"),
+    "/etc/",
   ];
   if (BLOCKED_PREFIXES.some((p) => resolved.startsWith(p))) return false;
   const BLOCKED_NAMES = [
-    '.env',
-    'credentials',
-    'id_rsa',
-    'id_ed25519',
-    '.netrc',
+    ".env",
+    "credentials",
+    "id_rsa",
+    "id_ed25519",
+    ".netrc",
   ];
   if (BLOCKED_NAMES.some((n) => path.basename(resolved).includes(n)))
     return false;
@@ -71,15 +76,15 @@ export function isPathSafe(filePath: string): boolean {
 export function isImageFile(filePath: string): boolean {
   const ext = path.extname(filePath).slice(1).toLowerCase();
   return [
-    'png',
-    'jpg',
-    'jpeg',
-    'gif',
-    'bmp',
-    'webp',
-    'svg',
-    'tiff',
-    'heic',
+    "png",
+    "jpg",
+    "jpeg",
+    "gif",
+    "bmp",
+    "webp",
+    "svg",
+    "tiff",
+    "heic",
   ].includes(ext);
 }
 
@@ -88,22 +93,22 @@ export function extractLocalFilePaths(text: string): string[] {
   const patterns = [
     new RegExp(
       `(?:保存到|saved to|wrote to|created|generated|生成)\\s+(?:文件\\s*)?[\`"]?([~/\\\\/][^\\s\`"\\n]{1,256}\\.${FILE_EXTENSIONS})[\`"]?`,
-      'gi',
+      "gi",
     ),
     new RegExp(
       `(?:文件|file|output)[\\s:：]*[\`"]?([~/\\\\/][^\\s\`"\\n]{1,256}\\.${FILE_EXTENSIONS})[\`"]?`,
-      'gi',
+      "gi",
     ),
     new RegExp(
       `^\\s*[-*]?\\s*[\`"]?(\\/[^\\s\`"\\n]{1,256}\\.${FILE_EXTENSIONS})[\`"]?\\s*$`,
-      'gmi',
+      "gmi",
     ),
   ];
   const candidates = new Set<string>();
   for (const pattern of patterns) {
     for (const match of text.matchAll(pattern)) {
-      let fp = match[1].replace(/[.。,，;；）)】\]]+$/, '');
-      if (fp.startsWith('~')) fp = fp.replace('~', os.homedir());
+      let fp = match[1].replace(/[.。,，;；）)】\]]+$/, "");
+      if (fp.startsWith("~")) fp = fp.replace("~", os.homedir());
       candidates.add(fp);
     }
   }
@@ -134,8 +139,8 @@ export function parseCwdArgs(args: string): {
 } {
   const hasNew = /\s+--new\s*$/.test(args) || /^--new\s+/.test(args);
   const pathArg = args
-    .replace(/\s+--new\s*$/, '')
-    .replace(/^--new\s+/, '')
+    .replace(/\s+--new\s*$/, "")
+    .replace(/^--new\s+/, "")
     .trim();
   return { path: pathArg, hasNew };
 }
@@ -144,7 +149,7 @@ export function parseCwdArgs(args: string): {
 
 /** Convert an absolute path to Claude's project directory name format. */
 export function pathToProjectDir(absPath: string): string {
-  return absPath.replace(/\//g, '-');
+  return absPath.replace(/\//g, "-");
 }
 
 export interface SessionInfo {
@@ -165,14 +170,14 @@ export async function scanClaudeSessions(
 ): Promise<SessionInfo[]> {
   const projectDir =
     projectDirOverride ||
-    path.join(os.homedir(), '.claude/projects', pathToProjectDir(workDir));
+    path.join(os.homedir(), ".claude/projects", pathToProjectDir(workDir));
   try {
     const files = fs.readdirSync(projectDir);
     const sessions: SessionInfo[] = [];
     for (const file of files) {
-      if (!file.endsWith('.jsonl')) continue;
+      if (!file.endsWith(".jsonl")) continue;
       try {
-        const sessionId = file.replace('.jsonl', '');
+        const sessionId = file.replace(".jsonl", "");
         const fp = path.join(projectDir, file);
         const stat = fs.statSync(fp);
         const summary = await readFirstUserMessage(fp);
@@ -193,41 +198,41 @@ export async function scanClaudeSessions(
       (a, b) => b.lastModified.getTime() - a.lastModified.getTime(),
     );
   } catch (err: unknown) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
     throw err;
   }
 }
 
 /** Read the first meaningful user message from a Claude session JSONL file. */
 export async function readFirstUserMessage(filePath: string): Promise<string> {
-  const fileStream = fs.createReadStream(filePath, { encoding: 'utf-8' });
+  const fileStream = fs.createReadStream(filePath, { encoding: "utf-8" });
   const lines = readline.createInterface({ input: fileStream });
   try {
     for await (const line of lines) {
       try {
         const entry = JSON.parse(line);
-        if (entry.type === 'user' && entry.message?.content) {
-          let text = '';
-          if (typeof entry.message.content === 'string') {
+        if (entry.type === "user" && entry.message?.content) {
+          let text = "";
+          if (typeof entry.message.content === "string") {
             text = entry.message.content;
           } else if (Array.isArray(entry.message.content)) {
             text = entry.message.content
-              .filter((b: { type: string }) => b.type === 'text')
+              .filter((b: { type: string }) => b.type === "text")
               .map((b: { text: string }) => b.text)
-              .join(' ');
+              .join(" ");
           }
           // Skip queue-operation entries
-          if (text.startsWith('queue-operation')) continue;
+          if (text.startsWith("queue-operation")) continue;
           lines.close();
-          return text.slice(0, 80).replace(/\n/g, ' ').trim() || '[empty]';
+          return text.slice(0, 80).replace(/\n/g, " ").trim() || "[empty]";
         }
       } catch {
         /* skip malformed lines */
       }
     }
-    return '[no user message]';
+    return "[no user message]";
   } catch {
-    return '[error]';
+    return "[error]";
   } finally {
     lines.close();
     fileStream.destroy();
@@ -244,7 +249,7 @@ export function resolveResumeTarget(
   // Pure numeric → index from cache
   if (/^\d+$/.test(args)) {
     if (!cachedSessions || cachedSessions.length === 0) {
-      return { sessionId: null, error: '请先执行 /sessions 获取会话列表' };
+      return { sessionId: null, error: "请先执行 /sessions 获取会话列表" };
     }
     const idx = parseInt(args) - 1;
     if (idx < 0 || idx >= cachedSessions.length) {
@@ -261,7 +266,7 @@ export function resolveResumeTarget(
   }
   // Short prefix match
   if (!cachedSessions || cachedSessions.length === 0) {
-    return { sessionId: null, error: '请先执行 /sessions 获取会话列表' };
+    return { sessionId: null, error: "请先执行 /sessions 获取会话列表" };
   }
   const matches = cachedSessions.filter((s) => s.id.startsWith(args));
   if (matches.length === 0) {
@@ -274,7 +279,7 @@ export function resolveResumeTarget(
     const list = matches
       .slice(0, 5)
       .map((s) => `<code>${s.id.slice(0, 12)}...</code>`)
-      .join(', ');
+      .join(", ");
     return {
       sessionId: null,
       error: `匹配到 ${matches.length} 个会话，请更精确：${list}`,
@@ -286,11 +291,11 @@ export function resolveResumeTarget(
 /** Format a Date as a relative time string. */
 function formatTimeAgo(date: Date): string {
   const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
-  if (seconds < 60) return '刚刚';
+  if (seconds < 60) return "刚刚";
   if (seconds < 3600) return `${Math.floor(seconds / 60)}分钟前`;
   if (seconds < 86400) return `${Math.floor(seconds / 3600)}小时前`;
   if (seconds < 604800) return `${Math.floor(seconds / 86400)}天前`;
-  return date.toLocaleDateString('zh-CN');
+  return date.toLocaleDateString("zh-CN");
 }
 
 // Sessions cache for /resume command (binding.id → last session list)
@@ -303,14 +308,19 @@ let projectsCache: string[] = [];
 // Persisted to ~/.claude-to-im/data/aliases.json for restart survival.
 const sessionAliases = new Map<string, string>();
 
-const ALIASES_FILE = path.join(os.homedir(), '.claude-to-im', 'data', 'aliases.json');
+const ALIASES_FILE = path.join(
+  os.homedir(),
+  ".claude-to-im",
+  "data",
+  "aliases.json",
+);
 
 function loadAliases(): void {
   try {
-    const raw = fs.readFileSync(ALIASES_FILE, 'utf8');
+    const raw = fs.readFileSync(ALIASES_FILE, "utf8");
     const obj = JSON.parse(raw) as Record<string, string>;
     for (const [k, v] of Object.entries(obj)) {
-      if (typeof k === 'string' && typeof v === 'string') {
+      if (typeof k === "string" && typeof v === "string") {
         sessionAliases.set(k, v);
       }
     }
@@ -321,12 +331,18 @@ function loadAliases(): void {
 
 function saveAliases(): void {
   try {
-    fs.writeFileSync(ALIASES_FILE, JSON.stringify(Object.fromEntries(sessionAliases), null, 2), 'utf8');
+    fs.writeFileSync(
+      ALIASES_FILE,
+      JSON.stringify(Object.fromEntries(sessionAliases), null, 2),
+      "utf8",
+    );
   } catch (err) {
-    console.warn('[bridge-manager] Failed to save aliases:', err instanceof Error ? err.message : err);
+    console.warn(
+      "[bridge-manager] Failed to save aliases:",
+      err instanceof Error ? err.message : err,
+    );
   }
 }
-
 
 /**
  * Decode a Claude project directory name back to an absolute path.
@@ -336,9 +352,9 @@ function saveAliases(): void {
 export function decodeProjectDir(encoded: string): string | null {
   // encoded: "-Users-aocai-AI-skill-hub" → should be "/Users/aocai/AI/skill-hub"
   // Strategy: start from left, greedily match filesystem directories
-  const parts = encoded.slice(1).split('-'); // remove leading -, split by -
-  let current = '';
-  let result = '/';
+  const parts = encoded.slice(1).split("-"); // remove leading -, split by -
+  let current = "";
+  let result = "/";
 
   for (let i = 0; i < parts.length; i++) {
     const candidate = current ? `${current}-${parts[i]}` : parts[i];
@@ -346,15 +362,15 @@ export function decodeProjectDir(encoded: string): string | null {
 
     if (fs.existsSync(asDir)) {
       // This segment exists as a directory, commit it
-      result = asDir + '/';
-      current = '';
+      result = asDir + "/";
+      current = "";
     } else if (i < parts.length - 1) {
       // Doesn't exist yet, might be part of a hyphenated name
       current = candidate;
     } else {
       // Last part: commit whatever we have
       result = result + candidate;
-      current = '';
+      current = "";
     }
   }
 
@@ -363,7 +379,7 @@ export function decodeProjectDir(encoded: string): string | null {
   }
 
   // Remove trailing /
-  result = result.replace(/\/$/, '');
+  result = result.replace(/\/$/, "");
 
   // Verify the decoded path actually exists
   return fs.existsSync(result) ? result : null;
@@ -374,23 +390,23 @@ export function decodeProjectDir(encoded: string): string | null {
  * Returns decoded absolute paths sorted by directory mtime (most recent first).
  */
 export function listKnownProjects(): string[] {
-  const projectsRoot = path.join(os.homedir(), '.claude/projects');
+  const projectsRoot = path.join(os.homedir(), ".claude/projects");
   try {
     const entries = fs.readdirSync(projectsRoot, { withFileTypes: true });
     const projects: { absPath: string; mtime: number }[] = [];
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
-      if (!entry.name.startsWith('-')) continue; // must start with -
+      if (!entry.name.startsWith("-")) continue; // must start with -
       const absPath = decodeProjectDir(entry.name);
       if (!absPath) continue; // couldn't decode or path doesn't exist
       try {
         const stat = fs.statSync(path.join(projectsRoot, entry.name));
         projects.push({ absPath, mtime: stat.mtimeMs });
-      } catch { continue; }
+      } catch {
+        continue;
+      }
     }
-    return projects
-      .sort((a, b) => b.mtime - a.mtime)
-      .map((p) => p.absPath);
+    return projects.sort((a, b) => b.mtime - a.mtime).map((p) => p.absPath);
   } catch {
     return [];
   }
@@ -404,7 +420,7 @@ const previousSdkSessionIds = new Map<string, string>();
 
 /** Generate a non-zero random 31-bit integer for use as draft_id. */
 function generateDraftId(): number {
-  return (Math.floor(Math.random() * 0x7FFFFFFE) + 1); // 1 .. 2^31-1
+  return Math.floor(Math.random() * 0x7ffffffe) + 1; // 1 .. 2^31-1
 }
 
 interface StreamConfig {
@@ -417,15 +433,22 @@ interface StreamConfig {
 const STREAM_DEFAULTS: Record<string, StreamConfig> = {
   telegram: { intervalMs: 700, minDeltaChars: 20, maxChars: 3900 },
   discord: { intervalMs: 1500, minDeltaChars: 40, maxChars: 1900 },
+  feishu: { intervalMs: 300, minDeltaChars: 10, maxChars: 4000 },
 };
 
-function getStreamConfig(channelType = 'telegram'): StreamConfig {
+function getStreamConfig(channelType = "telegram"): StreamConfig {
   const { store } = getBridgeContext();
   const defaults = STREAM_DEFAULTS[channelType] || STREAM_DEFAULTS.telegram;
   const prefix = `bridge_${channelType}_stream_`;
-  const intervalMs = parseInt(store.getSetting(`${prefix}interval_ms`) || '', 10) || defaults.intervalMs;
-  const minDeltaChars = parseInt(store.getSetting(`${prefix}min_delta_chars`) || '', 10) || defaults.minDeltaChars;
-  const maxChars = parseInt(store.getSetting(`${prefix}max_chars`) || '', 10) || defaults.maxChars;
+  const intervalMs =
+    parseInt(store.getSetting(`${prefix}interval_ms`) || "", 10) ||
+    defaults.intervalMs;
+  const minDeltaChars =
+    parseInt(store.getSetting(`${prefix}min_delta_chars`) || "", 10) ||
+    defaults.minDeltaChars;
+  const maxChars =
+    parseInt(store.getSetting(`${prefix}max_chars`) || "", 10) ||
+    defaults.maxChars;
   return { intervalMs, minDeltaChars, maxChars };
 }
 
@@ -437,29 +460,37 @@ function flushPreview(
 ): void {
   if (state.degraded || !adapter.sendPreview) return;
 
-  const text = state.pendingText.length > config.maxChars
-    ? state.pendingText.slice(0, config.maxChars) + '...'
-    : state.pendingText;
+  const text =
+    state.pendingText.length > config.maxChars
+      ? state.pendingText.slice(0, config.maxChars) + "..."
+      : state.pendingText;
 
   state.lastSentText = text;
   state.lastSentAt = Date.now();
 
-  adapter.sendPreview(state.chatId, text, state.draftId).then(result => {
-    if (result === 'degrade') state.degraded = true;
-    // 'skip' — transient failure, next flush will retry naturally
-  }).catch(() => {
-    // Network error — transient, don't degrade
-  });
+  adapter
+    .sendPreview(state.chatId, text, state.draftId)
+    .then((result) => {
+      if (result === "degrade") state.degraded = true;
+      // 'skip' — transient failure, next flush will retry naturally
+    })
+    .catch(() => {
+      // Network error — transient, don't degrade
+    });
 }
 
 // ── Channel-aware rendering dispatch ──────────────────────────
 
-import type { ChannelAddress, SendResult } from './types.js';
+import type { ChannelAddress, SendResult } from "./types.js";
 
 /**
  * Render response text and deliver via the appropriate channel format.
  * Telegram: Markdown → HTML chunks via deliverRendered.
  * Other channels: plain text via deliver (no HTML).
+ *
+ * If the adapter implements `deliverFinal`, that method is called instead
+ * of the built-in logic, allowing adapters (e.g. Feishu) to update an
+ * existing streaming card rather than posting a new message.
  */
 async function deliverResponse(
   adapter: BaseChannelAdapter,
@@ -468,43 +499,62 @@ async function deliverResponse(
   sessionId: string,
   replyToMessageId?: string,
 ): Promise<SendResult> {
-  if (adapter.channelType === 'telegram') {
+  // Delegate to adapter-specific final delivery if implemented
+  if (adapter.deliverFinal) {
+    return adapter.deliverFinal(address, responseText, sessionId);
+  }
+  if (adapter.channelType === "telegram") {
     const chunks = markdownToTelegramChunks(responseText, 4096);
     if (chunks.length > 0) {
-      return deliverRendered(adapter, address, chunks, { sessionId, replyToMessageId });
+      return deliverRendered(adapter, address, chunks, {
+        sessionId,
+        replyToMessageId,
+      });
     }
     return { ok: true };
   }
-  if (adapter.channelType === 'discord') {
+  if (adapter.channelType === "discord") {
     // Discord: native markdown, chunk at 2000 chars with fence repair
     const chunks = markdownToDiscordChunks(responseText, 2000);
     for (let i = 0; i < chunks.length; i++) {
-      const result = await deliver(adapter, {
-        address,
-        text: chunks[i].text,
-        parseMode: 'Markdown',
-        replyToMessageId,
-      }, { sessionId });
+      const result = await deliver(
+        adapter,
+        {
+          address,
+          text: chunks[i].text,
+          parseMode: "Markdown",
+          replyToMessageId,
+        },
+        { sessionId },
+      );
       if (!result.ok) return result;
     }
     return { ok: true };
   }
-  if (adapter.channelType === 'feishu') {
+  if (adapter.channelType === "feishu") {
     // Feishu: pass markdown through for adapter to format as post/card
-    return deliver(adapter, {
-      address,
-      text: responseText,
-      parseMode: 'Markdown',
-      replyToMessageId,
-    }, { sessionId });
+    return deliver(
+      adapter,
+      {
+        address,
+        text: responseText,
+        parseMode: "Markdown",
+        replyToMessageId,
+      },
+      { sessionId },
+    );
   }
   // Generic fallback: deliver as plain text (deliver() handles chunking internally)
-  return deliver(adapter, {
-    address,
-    text: responseText,
-    parseMode: 'plain',
-    replyToMessageId,
-  }, { sessionId });
+  return deliver(
+    adapter,
+    {
+      address,
+      text: responseText,
+      parseMode: "plain",
+      replyToMessageId,
+    },
+    { sessionId },
+  );
 }
 
 interface AdapterMeta {
@@ -549,18 +599,23 @@ function getState(): BridgeManagerState {
  * Process a function with per-session serialization.
  * Different sessions run concurrently; same-session requests are serialized.
  */
-function processWithSessionLock(sessionId: string, fn: () => Promise<void>): Promise<void> {
+function processWithSessionLock(
+  sessionId: string,
+  fn: () => Promise<void>,
+): Promise<void> {
   const state = getState();
   const prev = state.sessionLocks.get(sessionId) || Promise.resolve();
   const current = prev.then(fn, fn);
   state.sessionLocks.set(sessionId, current);
   // Cleanup when the chain completes.
   // Suppress rejection on the cleanup chain — callers handle errors on `current` directly.
-  current.finally(() => {
-    if (state.sessionLocks.get(sessionId) === current) {
-      state.sessionLocks.delete(sessionId);
-    }
-  }).catch(() => {});
+  current
+    .finally(() => {
+      if (state.sessionLocks.get(sessionId) === current) {
+        state.sessionLocks.delete(sessionId);
+      }
+    })
+    .catch(() => {});
   return current;
 }
 
@@ -577,16 +632,18 @@ export async function start(): Promise<void> {
 
   const { store, lifecycle } = getBridgeContext();
 
-  const bridgeEnabled = store.getSetting('remote_bridge_enabled') === 'true';
+  const bridgeEnabled = store.getSetting("remote_bridge_enabled") === "true";
   if (!bridgeEnabled) {
-    console.log('[bridge-manager] Bridge not enabled (remote_bridge_enabled != true)');
+    console.log(
+      "[bridge-manager] Bridge not enabled (remote_bridge_enabled != true)",
+    );
     return;
   }
 
   // Iterate all registered adapter types and create those that are enabled
   for (const channelType of getRegisteredTypes()) {
     const settingKey = `bridge_${channelType}_enabled`;
-    if (store.getSetting(settingKey) !== 'true') continue;
+    if (store.getSetting(settingKey) !== "true") continue;
 
     const adapter = createAdapter(channelType);
     if (!adapter) continue;
@@ -595,7 +652,10 @@ export async function start(): Promise<void> {
     if (!configError) {
       registerAdapter(adapter);
     } else {
-      console.warn(`[bridge-manager] ${channelType} adapter not valid:`, configError);
+      console.warn(
+        `[bridge-manager] ${channelType} adapter not valid:`,
+        configError,
+      );
     }
   }
 
@@ -613,7 +673,9 @@ export async function start(): Promise<void> {
 
   // Only mark as running if at least one adapter started successfully
   if (startedCount === 0) {
-    console.warn('[bridge-manager] No adapters started successfully, bridge not activated');
+    console.warn(
+      "[bridge-manager] No adapters started successfully, bridge not activated",
+    );
     state.adapters.clear();
     state.adapterMeta.clear();
     return;
@@ -634,7 +696,9 @@ export async function start(): Promise<void> {
     }
   }
 
-  console.log(`[bridge-manager] Bridge started with ${startedCount} adapter(s)`);
+  console.log(
+    `[bridge-manager] Bridge started with ${startedCount} adapter(s)`,
+  );
 }
 
 /**
@@ -671,7 +735,7 @@ export async function stop(): Promise<void> {
   // Notify host that bridge stopped
   lifecycle.onBridgeStop?.();
 
-  console.log('[bridge-manager] Bridge stopped');
+  console.log("[bridge-manager] Bridge stopped");
 }
 
 /**
@@ -686,11 +750,11 @@ export function tryAutoStart(): void {
   if (state.running) return;
 
   const { store } = getBridgeContext();
-  const autoStart = store.getSetting('bridge_auto_start');
-  if (autoStart !== 'true') return;
+  const autoStart = store.getSetting("bridge_auto_start");
+  if (autoStart !== "true") return;
 
-  start().catch(err => {
-    console.error('[bridge-manager] Auto-start failed:', err);
+  start().catch((err) => {
+    console.error("[bridge-manager] Auto-start failed:", err);
   });
 }
 
@@ -741,7 +805,7 @@ function runAdapterLoop(adapter: BaseChannelAdapter): void {
 
         // Callback queries and commands are lightweight — process inline.
         // Regular messages use per-session locking for concurrency.
-        if (msg.callbackData || msg.text.trim().startsWith('/')) {
+        if (msg.callbackData || msg.text.trim().startsWith("/")) {
           await handleMessage(adapter, msg);
         } else {
           const binding = router.resolve(msg.address);
@@ -749,27 +813,42 @@ function runAdapterLoop(adapter: BaseChannelAdapter): void {
           // messages for other sessions immediately.
           processWithSessionLock(binding.codepilotSessionId, () =>
             handleMessage(adapter, msg),
-          ).catch(err => {
-            console.error(`[bridge-manager] Session ${binding.codepilotSessionId.slice(0, 8)} error:`, err);
+          ).catch((err) => {
+            console.error(
+              `[bridge-manager] Session ${binding.codepilotSessionId.slice(0, 8)} error:`,
+              err,
+            );
           });
         }
       } catch (err) {
         if (abort.signal.aborted) break;
         const errMsg = err instanceof Error ? err.message : String(err);
-        console.error(`[bridge-manager] Error in ${adapter.channelType} loop:`, err);
+        console.error(
+          `[bridge-manager] Error in ${adapter.channelType} loop:`,
+          err,
+        );
         // Track last error per adapter
-        const meta = state.adapterMeta.get(adapter.channelType) || { lastMessageAt: null, lastError: null };
+        const meta = state.adapterMeta.get(adapter.channelType) || {
+          lastMessageAt: null,
+          lastError: null,
+        };
         meta.lastError = errMsg;
         state.adapterMeta.set(adapter.channelType, meta);
         // Brief delay to prevent tight error loops
-        await new Promise(r => setTimeout(r, 1000));
+        await new Promise((r) => setTimeout(r, 1000));
       }
     }
-  })().catch(err => {
+  })().catch((err) => {
     if (!abort.signal.aborted) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      console.error(`[bridge-manager] ${adapter.channelType} loop crashed:`, err);
-      const meta = state.adapterMeta.get(adapter.channelType) || { lastMessageAt: null, lastError: null };
+      console.error(
+        `[bridge-manager] ${adapter.channelType} loop crashed:`,
+        err,
+      );
+      const meta = state.adapterMeta.get(adapter.channelType) || {
+        lastMessageAt: null,
+        lastError: null,
+      };
       meta.lastError = errMsg;
       state.adapterMeta.set(adapter.channelType, meta);
     }
@@ -787,7 +866,10 @@ async function handleMessage(
 
   // Update lastMessageAt for this adapter
   const adapterState = getState();
-  const meta = adapterState.adapterMeta.get(adapter.channelType) || { lastMessageAt: null, lastError: null };
+  const meta = adapterState.adapterMeta.get(adapter.channelType) || {
+    lastMessageAt: null,
+    lastError: null,
+  };
   meta.lastMessageAt = new Date().toISOString();
   adapterState.adapterMeta.set(adapter.channelType, meta);
 
@@ -802,13 +884,17 @@ async function handleMessage(
 
   // Handle callback queries (permission buttons)
   if (msg.callbackData) {
-    const handled = broker.handlePermissionCallback(msg.callbackData, msg.address.chatId, msg.callbackMessageId);
+    const handled = broker.handlePermissionCallback(
+      msg.callbackData,
+      msg.address.chatId,
+      msg.callbackMessageId,
+    );
     if (handled) {
       // Send confirmation
       const confirmMsg: OutboundMessage = {
         address: msg.address,
-        text: 'Permission response recorded.',
-        parseMode: 'plain',
+        text: "Permission response recorded.",
+        parseMode: "plain",
       };
       await deliver(adapter, confirmMsg);
     }
@@ -821,12 +907,14 @@ async function handleMessage(
 
   // Handle image-only download failures — surface error to user instead of silently dropping
   if (!rawText && !hasAttachments) {
-    const rawData = msg.raw as { imageDownloadFailed?: boolean; failedCount?: number } | undefined;
+    const rawData = msg.raw as
+      | { imageDownloadFailed?: boolean; failedCount?: number }
+      | undefined;
     if (rawData?.imageDownloadFailed) {
       await deliver(adapter, {
         address: msg.address,
         text: `Failed to download ${rawData.failedCount ?? 1} image(s). Please try sending again.`,
-        parseMode: 'plain',
+        parseMode: "plain",
         replyToMessageId: msg.messageId,
       });
     }
@@ -835,7 +923,7 @@ async function handleMessage(
   }
 
   // Check for IM commands (before sanitization — commands are validated individually)
-  if (rawText.startsWith('/')) {
+  if (rawText.startsWith("/")) {
     await handleCommand(adapter, msg, rawText);
     ack();
     return;
@@ -844,17 +932,22 @@ async function handleMessage(
   // Sanitize general message text before routing to conversation engine
   const { text, truncated } = sanitizeInput(rawText);
   if (truncated) {
-    console.warn(`[bridge-manager] Input truncated from ${rawText.length} to ${text.length} chars for chat ${msg.address.chatId}`);
+    console.warn(
+      `[bridge-manager] Input truncated from ${rawText.length} to ${text.length} chars for chat ${msg.address.chatId}`,
+    );
     store.insertAuditLog({
       channelType: adapter.channelType,
       chatId: msg.address.chatId,
-      direction: 'inbound',
+      direction: "inbound",
       messageId: msg.messageId,
       summary: `[TRUNCATED] Input truncated from ${rawText.length} chars`,
     });
   }
 
-  if (!text && !hasAttachments) { ack(); return; }
+  if (!text && !hasAttachments) {
+    ack();
+    return;
+  }
 
   // Regular message — route to conversation engine
   const binding = router.resolve(msg.address);
@@ -874,78 +967,89 @@ async function handleMessage(
     previewState = {
       draftId: generateDraftId(),
       chatId: msg.address.chatId,
-      lastSentText: '',
+      lastSentText: "",
       lastSentAt: 0,
       degraded: false,
       throttleTimer: null,
-      pendingText: '',
+      pendingText: "",
     };
   }
 
   const streamCfg = previewState ? getStreamConfig(adapter.channelType) : null;
 
   // Build the onPartialText callback (or undefined if preview not supported)
-  const onPartialText = (previewState && streamCfg) ? (fullText: string) => {
-    const ps = previewState!;
-    const cfg = streamCfg!;
-    if (ps.degraded) return;
+  const onPartialText =
+    previewState && streamCfg
+      ? (fullText: string) => {
+          const ps = previewState!;
+          const cfg = streamCfg!;
+          if (ps.degraded) return;
 
-    // Truncate to maxChars + ellipsis
-    ps.pendingText = fullText.length > cfg.maxChars
-      ? fullText.slice(0, cfg.maxChars) + '...'
-      : fullText;
+          // Truncate to maxChars + ellipsis
+          ps.pendingText =
+            fullText.length > cfg.maxChars
+              ? fullText.slice(0, cfg.maxChars) + "..."
+              : fullText;
 
-    const delta = ps.pendingText.length - ps.lastSentText.length;
-    const elapsed = Date.now() - ps.lastSentAt;
+          const delta = ps.pendingText.length - ps.lastSentText.length;
+          const elapsed = Date.now() - ps.lastSentAt;
 
-    if (delta < cfg.minDeltaChars && ps.lastSentAt > 0) {
-      // Not enough new content — schedule trailing-edge timer if not already set
-      if (!ps.throttleTimer) {
-        ps.throttleTimer = setTimeout(() => {
-          ps.throttleTimer = null;
-          if (!ps.degraded) flushPreview(adapter, ps, cfg);
-        }, cfg.intervalMs);
-      }
-      return;
-    }
+          if (delta < cfg.minDeltaChars && ps.lastSentAt > 0) {
+            // Not enough new content — schedule trailing-edge timer if not already set
+            if (!ps.throttleTimer) {
+              ps.throttleTimer = setTimeout(() => {
+                ps.throttleTimer = null;
+                if (!ps.degraded) flushPreview(adapter, ps, cfg);
+              }, cfg.intervalMs);
+            }
+            return;
+          }
 
-    if (elapsed < cfg.intervalMs && ps.lastSentAt > 0) {
-      // Too soon — schedule trailing-edge timer to ensure latest text is sent
-      if (!ps.throttleTimer) {
-        ps.throttleTimer = setTimeout(() => {
-          ps.throttleTimer = null;
-          if (!ps.degraded) flushPreview(adapter, ps, cfg);
-        }, cfg.intervalMs - elapsed);
-      }
-      return;
-    }
+          if (elapsed < cfg.intervalMs && ps.lastSentAt > 0) {
+            // Too soon — schedule trailing-edge timer to ensure latest text is sent
+            if (!ps.throttleTimer) {
+              ps.throttleTimer = setTimeout(() => {
+                ps.throttleTimer = null;
+                if (!ps.degraded) flushPreview(adapter, ps, cfg);
+              }, cfg.intervalMs - elapsed);
+            }
+            return;
+          }
 
-    // Clear any pending trailing-edge timer and flush immediately
-    if (ps.throttleTimer) {
-      clearTimeout(ps.throttleTimer);
-      ps.throttleTimer = null;
-    }
-    flushPreview(adapter, ps, cfg);
-  } : undefined;
+          // Clear any pending trailing-edge timer and flush immediately
+          if (ps.throttleTimer) {
+            clearTimeout(ps.throttleTimer);
+            ps.throttleTimer = null;
+          }
+          flushPreview(adapter, ps, cfg);
+        }
+      : undefined;
 
   try {
     // Pass permission callback so requests are forwarded to IM immediately
     // during streaming (the stream blocks until permission is resolved).
     // Use text or empty string for image-only messages (prompt is still required by streamClaude)
-    const promptText = text || (hasAttachments ? 'Describe this image.' : '');
+    const promptText = text || (hasAttachments ? "Describe this image." : "");
 
-    const result = await engine.processMessage(binding, promptText, async (perm) => {
-      await broker.forwardPermissionRequest(
-        adapter,
-        msg.address,
-        perm.permissionRequestId,
-        perm.toolName,
-        perm.toolInput,
-        binding.codepilotSessionId,
-        perm.suggestions,
-        msg.messageId,
-      );
-    }, taskAbort.signal, hasAttachments ? msg.attachments : undefined, onPartialText);
+    const result = await engine.processMessage(
+      binding,
+      promptText,
+      async (perm) => {
+        await broker.forwardPermissionRequest(
+          adapter,
+          msg.address,
+          perm.permissionRequestId,
+          perm.toolName,
+          perm.toolInput,
+          binding.codepilotSessionId,
+          perm.suggestions,
+          msg.messageId,
+        );
+      },
+      taskAbort.signal,
+      hasAttachments ? msg.attachments : undefined,
+      onPartialText,
+    );
 
     // Send response text — render via channel-appropriate format
     if (result.responseText) {
@@ -955,10 +1059,16 @@ async function handleMessage(
       const responseToSend = alias
         ? `📌 ${alias}\n\n${result.responseText}`
         : result.responseText;
-      await deliverResponse(adapter, msg.address, responseToSend, binding.codepilotSessionId, msg.messageId);
+      await deliverResponse(
+        adapter,
+        msg.address,
+        responseToSend,
+        binding.codepilotSessionId,
+        msg.messageId,
+      );
 
       // B3: Auto-detect and send files mentioned in Claude's response
-      if (adapter.channelType === 'feishu') {
+      if (adapter.channelType === "feishu") {
         const filePaths = extractLocalFilePaths(result.responseText);
         const feishuClient = (
           adapter as unknown as { getLarkClient(): unknown }
@@ -975,7 +1085,7 @@ async function handleMessage(
               await deliver(adapter, {
                 address: msg.address,
                 text: `File auto-send failed: ${path.basename(fp)}. Use /send ${fp} to retry`,
-                parseMode: 'plain',
+                parseMode: "plain",
               });
             }
           }
@@ -985,7 +1095,7 @@ async function handleMessage(
       const errorResponse: OutboundMessage = {
         address: msg.address,
         text: `<b>Error:</b> ${escapeHtml(result.errorMessage)}`,
-        parseMode: 'HTML',
+        parseMode: "HTML",
         replyToMessageId: msg.messageId,
       };
       await deliver(adapter, errorResponse);
@@ -996,11 +1106,16 @@ async function handleMessage(
     // stale ID so the next message starts fresh instead of retrying a broken resume.
     if (binding.id) {
       try {
-        const update = computeSdkSessionUpdate(result.sdkSessionId, result.hasError);
+        const update = computeSdkSessionUpdate(
+          result.sdkSessionId,
+          result.hasError,
+        );
         if (update !== null) {
           store.updateChannelBinding(binding.id, { sdkSessionId: update });
         }
-      } catch { /* best effort */ }
+      } catch {
+        /* best effort */
+      }
     }
   } finally {
     // Clean up preview state
@@ -1032,8 +1147,8 @@ async function handleCommand(
 
   // Extract command and args (handle /command@botname format)
   const parts = text.split(/\s+/);
-  const command = parts[0].split('@')[0].toLowerCase();
-  const args = parts.slice(1).join(' ').trim();
+  const command = parts[0].split("@")[0].toLowerCase();
+  const args = parts.slice(1).join(" ").trim();
 
   // Run dangerous-input detection on the full command text
   const dangerCheck = isDangerousInput(text);
@@ -1041,46 +1156,49 @@ async function handleCommand(
     store.insertAuditLog({
       channelType: adapter.channelType,
       chatId: msg.address.chatId,
-      direction: 'inbound',
+      direction: "inbound",
       messageId: msg.messageId,
       summary: `[BLOCKED] Dangerous input detected: ${dangerCheck.reason}`,
     });
-    console.warn(`[bridge-manager] Blocked dangerous command input from chat ${msg.address.chatId}: ${dangerCheck.reason}`);
+    console.warn(
+      `[bridge-manager] Blocked dangerous command input from chat ${msg.address.chatId}: ${dangerCheck.reason}`,
+    );
     await deliver(adapter, {
       address: msg.address,
       text: `Command rejected: invalid input detected.`,
-      parseMode: 'plain',
+      parseMode: "plain",
       replyToMessageId: msg.messageId,
     });
     return;
   }
 
-  let response = '';
+  let response = "";
 
   switch (command) {
-    case '/start':
+    case "/start":
       response = [
-        '<b>🤖 Claude Bridge</b>',
-        '',
-        '直接发消息即可与 Claude 对话。',
-        '',
-        '<b>常用命令：</b>',
-        '/cwd — 查看/切换项目',
-        '/sessions — 查看历史会话',
-        '/resume &lt;序号&gt; — 恢复会话',
-        '/new — 新建会话',
-        '/name &lt;名称&gt; — 给会话命名',
-        '/help — 查看全部命令',
-      ].join('\n');
+        "<b>🤖 Claude Bridge</b>",
+        "",
+        "直接发消息即可与 Claude 对话。",
+        "",
+        "<b>常用命令：</b>",
+        "/cwd — 查看/切换项目",
+        "/sessions — 查看历史会话",
+        "/resume &lt;序号&gt; — 恢复会话",
+        "/new — 新建会话",
+        "/name &lt;名称&gt; — 给会话命名",
+        "/help — 查看全部命令",
+      ].join("\n");
       break;
 
-    case '/n':
-    case '/new': {
+    case "/n":
+    case "/new": {
       let workDir: string | undefined;
       if (args) {
         const validated = validateWorkingDirectory(args);
         if (!validated) {
-          response = 'Invalid path. Must be an absolute path without traversal sequences.';
+          response =
+            "Invalid path. Must be an absolute path without traversal sequences.";
           break;
         }
         workDir = validated;
@@ -1092,17 +1210,17 @@ async function handleCommand(
       }
       const binding = router.createBinding(msg.address, workDir);
       // Explicitly clear sdkSessionId so the next message starts a fresh Claude session
-      router.updateBinding(binding.id, { sdkSessionId: '' });
-      response = `New session created.\nSession: <code>${binding.codepilotSessionId.slice(0, 8)}...</code>\nCWD: <code>${escapeHtml(binding.workingDirectory || '~')}</code>`;
+      router.updateBinding(binding.id, { sdkSessionId: "" });
+      response = `New session created.\nSession: <code>${binding.codepilotSessionId.slice(0, 8)}...</code>\nCWD: <code>${escapeHtml(binding.workingDirectory || "~")}</code>`;
       break;
     }
 
-    case '/b':
-    case '/back': {
+    case "/b":
+    case "/back": {
       const binding = router.resolve(msg.address);
       const prevId = previousSdkSessionIds.get(binding.id);
       if (!prevId) {
-        response = '⚠️ 没有可恢复的历史会话（仅在本次 daemon 运行期间有效）';
+        response = "⚠️ 没有可恢复的历史会话（仅在本次 daemon 运行期间有效）";
         break;
       }
       // Save current as previous before switching back
@@ -1114,10 +1232,10 @@ async function handleCommand(
       break;
     }
 
-    case '/r':
-    case '/resume': {
+    case "/r":
+    case "/resume": {
       if (!args || !args.trim()) {
-        response = 'Usage: /resume &lt;number|ID prefix|full ID&gt;';
+        response = "Usage: /resume &lt;number|ID prefix|full ID&gt;";
         break;
       }
       const resumeBinding = router.resolve(msg.address);
@@ -1128,7 +1246,10 @@ async function handleCommand(
       } else if (resumeResult.sessionId) {
         // Save current sdkSessionId for /back
         if (resumeBinding.sdkSessionId) {
-          previousSdkSessionIds.set(resumeBinding.id, resumeBinding.sdkSessionId);
+          previousSdkSessionIds.set(
+            resumeBinding.id,
+            resumeBinding.sdkSessionId,
+          );
         }
         router.updateBinding(resumeBinding.id, {
           sdkSessionId: resumeResult.sessionId,
@@ -1138,45 +1259,51 @@ async function handleCommand(
       break;
     }
 
-    case '/bind': {
+    case "/bind": {
       if (!args) {
-        response = 'Usage: /bind &lt;session_id&gt;';
+        response = "Usage: /bind &lt;session_id&gt;";
         break;
       }
       if (!validateSessionId(args)) {
-        response = 'Invalid session ID format. Expected a 32-64 character hex/UUID string.';
+        response =
+          "Invalid session ID format. Expected a 32-64 character hex/UUID string.";
         break;
       }
       const binding = router.bindToSession(msg.address, args);
       if (binding) {
         response = `Bound to session <code>${args.slice(0, 8)}...</code>`;
       } else {
-        response = 'Session not found.';
+        response = "Session not found.";
       }
       break;
     }
 
-    case '/cwd': {
+    case "/cwd": {
       // No args → list known projects
       if (!args) {
         const projects = listKnownProjects();
         if (projects.length === 0) {
-          response = '未找到任何项目目录';
+          response = "未找到任何项目目录";
           break;
         }
         projectsCache = projects;
         const binding = router.resolve(msg.address);
-        const currentCwd = binding.workingDirectory || '';
-        const lines = ['<b>📂 项目列表：</b>', ''];
+        const currentCwd = binding.workingDirectory || "";
+        const lines = ["<b>📂 项目列表：</b>", ""];
         for (let i = 0; i < Math.min(projects.length, 15); i++) {
-          const marker = projects[i] === currentCwd ? ' ◀' : '';
-          lines.push(`${i + 1}. <code>${escapeHtml(projects[i])}</code>${marker}`);
+          const marker = projects[i] === currentCwd ? " ◀" : "";
+          lines.push(
+            `${i + 1}. <code>${escapeHtml(projects[i])}</code>${marker}`,
+          );
         }
         if (projects.length > 15) {
           lines.push(`... 共 ${projects.length} 个项目`);
         }
-        lines.push('', '用 /cwd &lt;序号&gt; 切换，/cwd &lt;序号&gt; --new 切换并新建会话');
-        response = lines.join('\n');
+        lines.push(
+          "",
+          "用 /cwd &lt;序号&gt; 切换，/cwd &lt;序号&gt; --new 切换并新建会话",
+        );
+        response = lines.join("\n");
         break;
       }
 
@@ -1186,7 +1313,7 @@ async function handleCommand(
       let targetPath: string;
       if (/^\d+$/.test(cwdPathArg)) {
         if (projectsCache.length === 0) {
-          response = '请先执行 /cwd 查看项目列表';
+          response = "请先执行 /cwd 查看项目列表";
           break;
         }
         const idx = parseInt(cwdPathArg) - 1;
@@ -1199,7 +1326,8 @@ async function handleCommand(
         // Absolute path
         const validated = validateWorkingDirectory(cwdPathArg);
         if (!validated) {
-          response = 'Invalid path. Must be an absolute path without traversal sequences or special characters.';
+          response =
+            "Invalid path. Must be an absolute path without traversal sequences or special characters.";
           break;
         }
         targetPath = validated;
@@ -1208,7 +1336,7 @@ async function handleCommand(
       const binding = router.resolve(msg.address);
       router.updateBinding(binding.id, {
         workingDirectory: targetPath,
-        sdkSessionId: '',
+        sdkSessionId: "",
       });
       if (hasNew) {
         router.createBinding(msg.address, targetPath);
@@ -1219,9 +1347,9 @@ async function handleCommand(
       break;
     }
 
-    case '/mode': {
+    case "/mode": {
       if (!validateMode(args)) {
-        response = 'Usage: /mode plan|code|ask';
+        response = "Usage: /mode plan|code|ask";
         break;
       }
       const binding = router.resolve(msg.address);
@@ -1230,20 +1358,20 @@ async function handleCommand(
       break;
     }
 
-    case '/status': {
+    case "/status": {
       const binding = router.resolve(msg.address);
       response = [
-        '<b>Bridge Status</b>',
-        '',
+        "<b>Bridge Status</b>",
+        "",
         `Session: <code>${binding.codepilotSessionId.slice(0, 8)}...</code>`,
-        `CWD: <code>${escapeHtml(binding.workingDirectory || '~')}</code>`,
+        `CWD: <code>${escapeHtml(binding.workingDirectory || "~")}</code>`,
         `Mode: <b>${binding.mode}</b>`,
-        `Model: <code>${binding.model || 'default'}</code>`,
-      ].join('\n');
+        `Model: <code>${binding.model || "default"}</code>`,
+      ].join("\n");
       break;
     }
 
-    case '/sessions': {
+    case "/sessions": {
       const sessBinding = router.resolve(msg.address);
       const workDir = args || sessBinding.workingDirectory;
 
@@ -1254,69 +1382,80 @@ async function handleCommand(
           response = `📂 ${escapeHtml(workDir)} 下无历史会话`;
         } else {
           sessionsCache.set(sessBinding.id, sessions);
-          const lines = [
-            `<b>📂 ${escapeHtml(workDir)} 历史会话：</b>`,
-            '',
-          ];
+          const lines = [`<b>📂 ${escapeHtml(workDir)} 历史会话：</b>`, ""];
           const activeSdkId = sessBinding.sdkSessionId;
-          const activeAlias = sessionAliases.get(sessBinding.codepilotSessionId);
+          const activeAlias = sessionAliases.get(
+            sessBinding.codepilotSessionId,
+          );
           for (let i = 0; i < Math.min(sessions.length, 10); i++) {
             const s = sessions[i];
             const ago = formatTimeAgo(s.lastModified);
             const isActive = activeSdkId && s.id === activeSdkId;
-            const activeTag = isActive ? (activeAlias ? ` 📌 ${escapeHtml(activeAlias)}` : ' ◀ 当前') : '';
+            const activeTag = isActive
+              ? activeAlias
+                ? ` 📌 ${escapeHtml(activeAlias)}`
+                : " ◀ 当前"
+              : "";
             lines.push(
               `${i + 1}. "${escapeHtml(s.summary)}" (${ago})${activeTag}`,
             );
           }
-          lines.push('', '用 /resume &lt;序号&gt; 恢复，/name 给当前会话命名');
-          response = lines.join('\n');
+          lines.push("", "用 /resume &lt;序号&gt; 恢复，/name 给当前会话命名");
+          response = lines.join("\n");
         }
       } else {
         // No working directory — fallback to listing bindings
         const bindings = router.listBindings(adapter.channelType);
         if (bindings.length === 0) {
-          response = 'No sessions found.';
+          response = "No sessions found.";
         } else {
-          const lines = ['<b>Sessions:</b>', ''];
+          const lines = ["<b>Sessions:</b>", ""];
           for (const b of bindings.slice(0, 10)) {
-            const active = b.active ? 'active' : 'inactive';
+            const active = b.active ? "active" : "inactive";
             lines.push(
-              `<code>${b.codepilotSessionId.slice(0, 8)}...</code> [${active}] ${escapeHtml(b.workingDirectory || '~')}`,
+              `<code>${b.codepilotSessionId.slice(0, 8)}...</code> [${active}] ${escapeHtml(b.workingDirectory || "~")}`,
             );
           }
-          response = lines.join('\n');
+          response = lines.join("\n");
         }
       }
       break;
     }
 
-    case '/stop': {
+    case "/stop": {
       const binding = router.resolve(msg.address);
       const st = getState();
       const taskAbort = st.activeTasks.get(binding.codepilotSessionId);
       if (taskAbort) {
         taskAbort.abort();
         st.activeTasks.delete(binding.codepilotSessionId);
-        response = 'Stopping current task...';
+        response = "Stopping current task...";
       } else {
-        response = 'No task is currently running.';
+        response = "No task is currently running.";
       }
       break;
     }
 
-    case '/perm': {
+    case "/perm": {
       // Text-based permission approval fallback (for channels without inline buttons)
       // Usage: /perm allow <id> | /perm allow_session <id> | /perm deny <id>
       const permParts = args.split(/\s+/);
       const permAction = permParts[0];
-      const permId = permParts.slice(1).join(' ');
-      if (!permAction || !permId || !['allow', 'allow_session', 'deny'].includes(permAction)) {
-        response = 'Usage: /perm allow|allow_session|deny &lt;permission_id&gt;';
+      const permId = permParts.slice(1).join(" ");
+      if (
+        !permAction ||
+        !permId ||
+        !["allow", "allow_session", "deny"].includes(permAction)
+      ) {
+        response =
+          "Usage: /perm allow|allow_session|deny &lt;permission_id&gt;";
         break;
       }
       const callbackData = `perm:${permAction}:${permId}`;
-      const handled = broker.handlePermissionCallback(callbackData, msg.address.chatId);
+      const handled = broker.handlePermissionCallback(
+        callbackData,
+        msg.address.chatId,
+      );
       if (handled) {
         response = `Permission ${permAction}: recorded.`;
       } else {
@@ -1325,31 +1464,33 @@ async function handleCommand(
       break;
     }
 
-    case '/send': {
+    case "/send": {
       if (!args) {
-        response = 'Usage: /send /path/to/file';
+        response = "Usage: /send /path/to/file";
         break;
       }
       const sendFilePath = args.trim();
       if (!isPathSafe(sendFilePath)) {
         response =
-          'Safety restriction: sending files from this path is not allowed.';
+          "Safety restriction: sending files from this path is not allowed.";
         break;
       }
       try {
         const stat = fs.statSync(sendFilePath);
         if (!stat.isFile()) {
-          response = 'Path is not a file.';
+          response = "Path is not a file.";
           break;
         }
         if (stat.size > 30 * 1024 * 1024) {
           response = `File ${path.basename(sendFilePath)} (${(stat.size / 1024 / 1024).toFixed(1)}MB) exceeds 30MB limit`;
           break;
         }
-        if (adapter.channelType === 'feishu') {
-          const feishuClient = (adapter as unknown as { getLarkClient(): unknown }).getLarkClient();
+        if (adapter.channelType === "feishu") {
+          const feishuClient = (
+            adapter as unknown as { getLarkClient(): unknown }
+          ).getLarkClient();
           if (!feishuClient) {
-            response = 'Feishu client not initialized.';
+            response = "Feishu client not initialized.";
             break;
           }
           let sendResult;
@@ -1370,7 +1511,7 @@ async function handleCommand(
             ? `Sent ${path.basename(sendFilePath)}`
             : `Send failed: ${sendResult.error}`;
         } else {
-          response = 'File sending is currently only supported for Feishu.';
+          response = "File sending is currently only supported for Feishu.";
         }
       } catch {
         response = `File not found: ${sendFilePath}`;
@@ -1378,9 +1519,9 @@ async function handleCommand(
       break;
     }
 
-    case '/name': {
+    case "/name": {
       if (!args) {
-        response = '用法：/name 会话名称';
+        response = "用法：/name 会话名称";
         break;
       }
       const nameBinding = router.resolve(msg.address);
@@ -1390,34 +1531,34 @@ async function handleCommand(
       break;
     }
 
-    case '/help':
+    case "/help":
       response = [
-        '<b>📋 命令帮助</b>',
-        '',
-        '<b>会话管理</b>',
-        '/new (/n) — 新建会话',
-        '/sessions — 查看历史会话列表',
-        '/resume (/r) &lt;序号&gt; — 恢复指定会话',
-        '/back (/b) — 返回上一个会话',
-        '/name &lt;名称&gt; — 给当前会话命名',
-        '/stop — 停止当前任务',
-        '',
-        '<b>项目切换</b>',
-        '/cwd — 查看项目列表',
-        '/cwd &lt;序号&gt; — 切换到指定项目',
-        '/cwd &lt;序号&gt; --new — 切换项目并新建会话',
-        '',
-        '<b>设置</b>',
-        '/mode plan|code|ask — 切换模式',
-        '/status — 查看当前状态',
-        '',
-        '<b>文件</b>',
-        '/send &lt;路径&gt; — 发送本地文件到聊天',
-        '',
-        '<b>权限</b>',
-        '/perm allow|deny &lt;id&gt; — 批准/拒绝权限请求',
-        '/help - Show this help',
-      ].join('\n');
+        "<b>📋 命令帮助</b>",
+        "",
+        "<b>会话管理</b>",
+        "/new (/n) — 新建会话",
+        "/sessions — 查看历史会话列表",
+        "/resume (/r) &lt;序号&gt; — 恢复指定会话",
+        "/back (/b) — 返回上一个会话",
+        "/name &lt;名称&gt; — 给当前会话命名",
+        "/stop — 停止当前任务",
+        "",
+        "<b>项目切换</b>",
+        "/cwd — 查看项目列表",
+        "/cwd &lt;序号&gt; — 切换到指定项目",
+        "/cwd &lt;序号&gt; --new — 切换项目并新建会话",
+        "",
+        "<b>设置</b>",
+        "/mode plan|code|ask — 切换模式",
+        "/status — 查看当前状态",
+        "",
+        "<b>文件</b>",
+        "/send &lt;路径&gt; — 发送本地文件到聊天",
+        "",
+        "<b>权限</b>",
+        "/perm allow|deny &lt;id&gt; — 批准/拒绝权限请求",
+        "/help - Show this help",
+      ].join("\n");
       break;
 
     default:
@@ -1428,7 +1569,7 @@ async function handleCommand(
     await deliver(adapter, {
       address: msg.address,
       text: response,
-      parseMode: 'HTML',
+      parseMode: "HTML",
       replyToMessageId: msg.messageId,
     });
   }
@@ -1453,7 +1594,7 @@ export function computeSdkSessionUpdate(
     return sdkSessionId;
   }
   if (hasError) {
-    return '';
+    return "";
   }
   return null;
 }

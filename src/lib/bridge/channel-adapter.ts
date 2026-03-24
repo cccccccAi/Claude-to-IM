@@ -6,12 +6,13 @@
  */
 
 import type {
+  ChannelAddress,
   ChannelType,
   InboundMessage,
   OutboundMessage,
   PreviewCapabilities,
   SendResult,
-} from './types.js';
+} from "./types.js";
 
 export abstract class BaseChannelAdapter {
   /** Which channel type this adapter handles */
@@ -49,7 +50,10 @@ export abstract class BaseChannelAdapter {
    * Answer a callback query (e.g. Telegram inline button press).
    * Not all platforms support this — default implementation is a no-op.
    */
-  async answerCallback(_callbackQueryId: string, _text?: string): Promise<void> {
+  async answerCallback(
+    _callbackQueryId: string,
+    _text?: string,
+  ): Promise<void> {
     // No-op by default; override in adapters that support callback queries
   }
 
@@ -89,20 +93,49 @@ export abstract class BaseChannelAdapter {
    * Returns 'sent' on success, 'skip' for transient failures (caller should
    * retry later), or 'degrade' for permanent failures (caller should stop).
    */
-  sendPreview?(_chatId: string, _text: string, _draftId: number): Promise<'sent' | 'skip' | 'degrade'>;
+  sendPreview?(
+    _chatId: string,
+    _text: string,
+    _draftId: number,
+  ): Promise<"sent" | "skip" | "degrade">;
 
   /**
    * Signal the end of a preview cycle. The final message is sent via the
    * normal delivery path, so this is typically a no-op.
    */
   endPreview?(_chatId: string, _draftId: number): void;
+
+  /**
+   * Deliver the final response text to the channel after streaming completes.
+   *
+   * This is the hook point for adapters that want to replace or update an
+   * in-progress streaming preview with the finished message (e.g. Feishu
+   * interactive card update) instead of always posting a brand-new message.
+   *
+   * Default: undefined — when not implemented, bridge-manager falls back to
+   * its existing deliverResponse logic (post a new message), so Telegram,
+   * Discord, and other adapters are unaffected.
+   *
+   * @param address   - Destination address (chat / thread) for the message.
+   * @param responseText - The complete final response text in Markdown.
+   * @param sessionId - Active Codepilot session identifier.
+   * @returns A SendResult indicating success or failure.
+   */
+  deliverFinal?(
+    address: ChannelAddress,
+    responseText: string,
+    sessionId: string,
+  ): Promise<SendResult>;
 }
 
 // ── Adapter Registry ────────────────────────────────────────────
 
 const adapterFactories = new Map<string, () => BaseChannelAdapter>();
 
-export function registerAdapterFactory(channelType: string, factory: () => BaseChannelAdapter): void {
+export function registerAdapterFactory(
+  channelType: string,
+  factory: () => BaseChannelAdapter,
+): void {
   adapterFactories.set(channelType, factory);
 }
 

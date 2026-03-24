@@ -15,24 +15,37 @@
  * the normal /perm command processing pipeline.
  */
 
-import crypto from 'crypto';
-import * as lark from '@larksuiteoapi/node-sdk';
+import crypto from "crypto";
+import * as lark from "@larksuiteoapi/node-sdk";
 import type {
   ChannelType,
   InboundMessage,
   OutboundMessage,
   SendResult,
-} from '../types.js';
-import type { FileAttachment } from '../types.js';
-import { BaseChannelAdapter, registerAdapterFactory } from '../channel-adapter.js';
-import { getBridgeContext } from '../context.js';
+} from "../types.js";
+import type { FileAttachment } from "../types.js";
+import {
+  BaseChannelAdapter,
+  registerAdapterFactory,
+} from "../channel-adapter.js";
+import { getBridgeContext } from "../context.js";
 import {
   htmlToFeishuMarkdown,
   preprocessFeishuMarkdown,
   hasComplexMarkdown,
   buildCardContent,
   buildPostContent,
-} from '../markdown/feishu.js';
+} from "../markdown/feishu.js";
+import {
+  createStreamingCard,
+  sendCardMessage,
+  streamContent,
+  finalizeCard,
+} from "./feishu-cardkit.js";
+import {
+  buildFinalCardJson,
+  preprocessFeishuMarkdown as buildPreviewMarkdown,
+} from "./feishu-card-builder.js";
 
 /** Max number of message_ids to keep for dedup. */
 const DEDUP_MAX = 1000;
@@ -41,7 +54,7 @@ const DEDUP_MAX = 1000;
 const MAX_FILE_SIZE = 20 * 1024 * 1024;
 
 /** Feishu emoji type for typing indicator (same as Openclaw). */
-const TYPING_EMOJI = 'Typing';
+const TYPING_EMOJI = "Typing";
 
 /** Shape of the SDK's im.message.receive_v1 event data. */
 type FeishuMessageEventData = {
@@ -69,18 +82,17 @@ type FeishuMessageEventData = {
   };
 };
 
-
 /** MIME type guesses by message_type. */
 const MIME_BY_TYPE: Record<string, string> = {
-  image: 'image/png',
-  file: 'application/octet-stream',
-  audio: 'audio/ogg',
-  video: 'video/mp4',
-  media: 'application/octet-stream',
+  image: "image/png",
+  file: "application/octet-stream",
+  audio: "audio/ogg",
+  video: "video/mp4",
+  media: "application/octet-stream",
 };
 
 export class FeishuAdapter extends BaseChannelAdapter {
-  readonly channelType: ChannelType = 'feishu';
+  readonly channelType: ChannelType = "feishu";
 
   private running = false;
   private queue: InboundMessage[] = [];
@@ -95,6 +107,18 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private lastIncomingMessageId = new Map<string, string>();
   /** Track active typing reaction IDs per chat for cleanup. */
   private typingReactions = new Map<string, string>();
+  /** 每个 chat+draft 的活跃流式卡片状态 */
+  private streamingCards: Map<
+    string,
+    {
+      cardId: string;
+      messageId: string;
+      sequence: number;
+      startTime: number;
+      pendingText: string;
+      throttleTimer: ReturnType<typeof setTimeout> | null;
+    }
+  > = new Map();
 
   // ── Lifecycle ───────────────────────────────────────────────
 
@@ -103,16 +127,18 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     const configError = this.validateConfig();
     if (configError) {
-      console.warn('[feishu-adapter] Cannot start:', configError);
+      console.warn("[feishu-adapter] Cannot start:", configError);
       return;
     }
 
-    const appId = getBridgeContext().store.getSetting('bridge_feishu_app_id') || '';
-    const appSecret = getBridgeContext().store.getSetting('bridge_feishu_app_secret') || '';
-    const domainSetting = getBridgeContext().store.getSetting('bridge_feishu_domain') || 'feishu';
-    const domain = domainSetting === 'lark'
-      ? lark.Domain.Lark
-      : lark.Domain.Feishu;
+    const appId =
+      getBridgeContext().store.getSetting("bridge_feishu_app_id") || "";
+    const appSecret =
+      getBridgeContext().store.getSetting("bridge_feishu_app_secret") || "";
+    const domainSetting =
+      getBridgeContext().store.getSetting("bridge_feishu_domain") || "feishu";
+    const domain =
+      domainSetting === "lark" ? lark.Domain.Lark : lark.Domain.Feishu;
 
     // Create REST client
     this.restClient = new lark.Client({
@@ -131,7 +157,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     // Openclaw uses an HTTP server for card callbacks — CodePilot is a desktop app
     // without a public endpoint, so we rely on text-based /perm commands instead.
     const dispatcher = new lark.EventDispatcher({}).register({
-      'im.message.receive_v1': async (data) => {
+      "im.message.receive_v1": async (data) => {
         await this.handleIncomingEvent(data as FeishuMessageEventData);
       },
     });
@@ -144,7 +170,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
     });
     this.wsClient.start({ eventDispatcher: dispatcher });
 
-    console.log('[feishu-adapter] Started (botOpenId:', this.botOpenId || 'unknown', ')');
+    console.log(
+      "[feishu-adapter] Started (botOpenId:",
+      this.botOpenId || "unknown",
+      ")",
+    );
   }
 
   async stop(): Promise<void> {
@@ -156,7 +186,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
       try {
         this.wsClient.close({ force: true });
       } catch (err) {
-        console.warn('[feishu-adapter] WSClient close error:', err instanceof Error ? err.message : err);
+        console.warn(
+          "[feishu-adapter] WSClient close error:",
+          err instanceof Error ? err.message : err,
+        );
       }
       this.wsClient = null;
     }
@@ -173,7 +206,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     this.lastIncomingMessageId.clear();
     this.typingReactions.clear();
 
-    console.log('[feishu-adapter] Stopped');
+    console.log("[feishu-adapter] Stopped");
   }
 
   isRunning(): boolean {
@@ -213,22 +246,28 @@ export class FeishuAdapter extends BaseChannelAdapter {
     if (!messageId || !this.restClient) return;
 
     // Fire-and-forget — typing indicator is non-critical
-    this.restClient.im.messageReaction.create({
-      path: { message_id: messageId },
-      data: { reaction_type: { emoji_type: TYPING_EMOJI } },
-    }).then((res) => {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const reactionId = (res as any)?.data?.reaction_id;
-      if (reactionId) {
-        this.typingReactions.set(chatId, reactionId);
-      }
-    }).catch((err) => {
-      // Non-critical — don't log rate limit errors
-      const code = (err as { code?: number })?.code;
-      if (code !== 99991400 && code !== 99991403) {
-        console.warn('[feishu-adapter] Typing indicator failed:', err instanceof Error ? err.message : err);
-      }
-    });
+    this.restClient.im.messageReaction
+      .create({
+        path: { message_id: messageId },
+        data: { reaction_type: { emoji_type: TYPING_EMOJI } },
+      })
+      .then((res) => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const reactionId = (res as any)?.data?.reaction_id;
+        if (reactionId) {
+          this.typingReactions.set(chatId, reactionId);
+        }
+      })
+      .catch((err) => {
+        // Non-critical — don't log rate limit errors
+        const code = (err as { code?: number })?.code;
+        if (code !== 99991400 && code !== 99991403) {
+          console.warn(
+            "[feishu-adapter] Typing indicator failed:",
+            err instanceof Error ? err.message : err,
+          );
+        }
+      });
   }
 
   /**
@@ -243,33 +282,41 @@ export class FeishuAdapter extends BaseChannelAdapter {
     this.typingReactions.delete(chatId);
 
     // Fire-and-forget — failure is fine (reaction may already be gone)
-    this.restClient.im.messageReaction.delete({
-      path: { message_id: messageId, reaction_id: reactionId },
-    }).catch(() => { /* ignore */ });
+    this.restClient.im.messageReaction
+      .delete({
+        path: { message_id: messageId, reaction_id: reactionId },
+      })
+      .catch(() => {
+        /* ignore */
+      });
   }
 
   // ── Send ────────────────────────────────────────────────────
 
   async send(message: OutboundMessage): Promise<SendResult> {
     if (!this.restClient) {
-      return { ok: false, error: 'Feishu client not initialized' };
+      return { ok: false, error: "Feishu client not initialized" };
     }
 
     let text = message.text;
 
     // Convert HTML to markdown for Feishu rendering (e.g. command responses)
-    if (message.parseMode === 'HTML') {
+    if (message.parseMode === "HTML") {
       text = htmlToFeishuMarkdown(text);
     }
 
     // Preprocess markdown for Claude responses
-    if (message.parseMode === 'Markdown') {
+    if (message.parseMode === "Markdown") {
       text = preprocessFeishuMarkdown(text);
     }
 
     // If there are inline buttons (permission prompts), send card with action buttons
     if (message.inlineButtons && message.inlineButtons.length > 0) {
-      return this.sendPermissionCard(message.address.chatId, text, message.inlineButtons);
+      return this.sendPermissionCard(
+        message.address.chatId,
+        text,
+        message.inlineButtons,
+      );
     }
 
     // Rendering strategy (aligned with Openclaw):
@@ -290,10 +337,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     try {
       const res = await this.restClient!.im.message.create({
-        params: { receive_id_type: 'chat_id' },
+        params: { receive_id_type: "chat_id" },
         data: {
           receive_id: chatId,
-          msg_type: 'interactive',
+          msg_type: "interactive",
           content: cardContent,
         },
       });
@@ -301,9 +348,12 @@ export class FeishuAdapter extends BaseChannelAdapter {
       if (res?.data?.message_id) {
         return { ok: true, messageId: res.data.message_id };
       }
-      console.warn('[feishu-adapter] Card send failed:', res?.msg, res?.code);
+      console.warn("[feishu-adapter] Card send failed:", res?.msg, res?.code);
     } catch (err) {
-      console.warn('[feishu-adapter] Card send error, falling back to post:', err instanceof Error ? err.message : err);
+      console.warn(
+        "[feishu-adapter] Card send error, falling back to post:",
+        err instanceof Error ? err.message : err,
+      );
     }
 
     // Fallback to post
@@ -319,10 +369,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     try {
       const res = await this.restClient!.im.message.create({
-        params: { receive_id_type: 'chat_id' },
+        params: { receive_id_type: "chat_id" },
         data: {
           receive_id: chatId,
-          msg_type: 'post',
+          msg_type: "post",
           content: postContent,
         },
       });
@@ -330,27 +380,33 @@ export class FeishuAdapter extends BaseChannelAdapter {
       if (res?.data?.message_id) {
         return { ok: true, messageId: res.data.message_id };
       }
-      console.warn('[feishu-adapter] Post send failed:', res?.msg, res?.code);
+      console.warn("[feishu-adapter] Post send failed:", res?.msg, res?.code);
     } catch (err) {
-      console.warn('[feishu-adapter] Post send error, falling back to text:', err instanceof Error ? err.message : err);
+      console.warn(
+        "[feishu-adapter] Post send error, falling back to text:",
+        err instanceof Error ? err.message : err,
+      );
     }
 
     // Final fallback: plain text
     try {
       const res = await this.restClient!.im.message.create({
-        params: { receive_id_type: 'chat_id' },
+        params: { receive_id_type: "chat_id" },
         data: {
           receive_id: chatId,
-          msg_type: 'text',
+          msg_type: "text",
           content: JSON.stringify({ text }),
         },
       });
       if (res?.data?.message_id) {
         return { ok: true, messageId: res.data.message_id };
       }
-      return { ok: false, error: res?.msg || 'Send failed' };
+      return { ok: false, error: res?.msg || "Send failed" };
     } catch (err) {
-      return { ok: false, error: err instanceof Error ? err.message : 'Send failed' };
+      return {
+        ok: false,
+        error: err instanceof Error ? err.message : "Send failed",
+      };
     }
   }
 
@@ -367,18 +423,18 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private async sendPermissionCard(
     chatId: string,
     text: string,
-    inlineButtons: import('../types.js').InlineButton[][],
+    inlineButtons: import("../types.js").InlineButton[][],
   ): Promise<SendResult> {
     if (!this.restClient) {
-      return { ok: false, error: 'Feishu client not initialized' };
+      return { ok: false, error: "Feishu client not initialized" };
     }
 
     // Build /perm command lines from inline buttons
     const permCommands = inlineButtons.flat().map((btn) => {
-      if (btn.callbackData.startsWith('perm:')) {
-        const parts = btn.callbackData.split(':');
+      if (btn.callbackData.startsWith("perm:")) {
+        const parts = btn.callbackData.split(":");
         const action = parts[1];
-        const permId = parts.slice(2).join(':');
+        const permId = parts.slice(2).join(":");
         return `\`/perm ${action} ${permId}\``;
       }
       return btn.text;
@@ -387,95 +443,104 @@ export class FeishuAdapter extends BaseChannelAdapter {
     // Schema 2.0 card with markdown — permission info + copyable commands
     const cardContent = [
       text,
-      '',
-      '---',
-      '**Reply with one of these commands:**',
+      "",
+      "---",
+      "**Reply with one of these commands:**",
       ...permCommands,
-    ].join('\n');
+    ].join("\n");
 
     const cardJson = JSON.stringify({
-      schema: '2.0',
+      schema: "2.0",
       config: { wide_screen_mode: true },
       header: {
-        template: 'orange',
-        title: { tag: 'plain_text', content: '🔐 Permission Required' },
+        template: "orange",
+        title: { tag: "plain_text", content: "🔐 Permission Required" },
       },
       body: {
-        elements: [
-          { tag: 'markdown', content: cardContent },
-        ],
+        elements: [{ tag: "markdown", content: cardContent }],
       },
     });
 
     try {
       const res = await this.restClient.im.message.create({
-        params: { receive_id_type: 'chat_id' },
+        params: { receive_id_type: "chat_id" },
         data: {
           receive_id: chatId,
-          msg_type: 'interactive',
+          msg_type: "interactive",
           content: cardJson,
         },
       });
       if (res?.data?.message_id) {
         return { ok: true, messageId: res.data.message_id };
       }
-      console.warn('[feishu-adapter] Permission card send failed:', res?.msg);
+      console.warn("[feishu-adapter] Permission card send failed:", res?.msg);
     } catch (err) {
-      console.warn('[feishu-adapter] Permission card error:', err instanceof Error ? err.message : err);
+      console.warn(
+        "[feishu-adapter] Permission card error:",
+        err instanceof Error ? err.message : err,
+      );
     }
 
     // Fallback: plain text
     const plainCommands = inlineButtons.flat().map((btn) => {
-      if (btn.callbackData.startsWith('perm:')) {
-        const parts = btn.callbackData.split(':');
-        return `/perm ${parts[1]} ${parts.slice(2).join(':')}`;
+      if (btn.callbackData.startsWith("perm:")) {
+        const parts = btn.callbackData.split(":");
+        return `/perm ${parts[1]} ${parts.slice(2).join(":")}`;
       }
       return btn.text;
     });
-    const fallbackText = text + '\n\nReply with:\n' + plainCommands.join('\n');
+    const fallbackText = text + "\n\nReply with:\n" + plainCommands.join("\n");
 
     try {
       const res = await this.restClient.im.message.create({
-        params: { receive_id_type: 'chat_id' },
+        params: { receive_id_type: "chat_id" },
         data: {
           receive_id: chatId,
-          msg_type: 'text',
+          msg_type: "text",
           content: JSON.stringify({ text: fallbackText }),
         },
       });
       if (res?.data?.message_id) {
         return { ok: true, messageId: res.data.message_id };
       }
-      return { ok: false, error: res?.msg || 'Send failed' };
+      return { ok: false, error: res?.msg || "Send failed" };
     } catch (err) {
-      return { ok: false, error: err instanceof Error ? err.message : 'Send failed' };
+      return {
+        ok: false,
+        error: err instanceof Error ? err.message : "Send failed",
+      };
     }
   }
 
   // ── Config & Auth ───────────────────────────────────────────
 
   validateConfig(): string | null {
-    const enabled = getBridgeContext().store.getSetting('bridge_feishu_enabled');
-    if (enabled !== 'true') return 'bridge_feishu_enabled is not true';
+    const enabled = getBridgeContext().store.getSetting(
+      "bridge_feishu_enabled",
+    );
+    if (enabled !== "true") return "bridge_feishu_enabled is not true";
 
-    const appId = getBridgeContext().store.getSetting('bridge_feishu_app_id');
-    if (!appId) return 'bridge_feishu_app_id not configured';
+    const appId = getBridgeContext().store.getSetting("bridge_feishu_app_id");
+    if (!appId) return "bridge_feishu_app_id not configured";
 
-    const appSecret = getBridgeContext().store.getSetting('bridge_feishu_app_secret');
-    if (!appSecret) return 'bridge_feishu_app_secret not configured';
+    const appSecret = getBridgeContext().store.getSetting(
+      "bridge_feishu_app_secret",
+    );
+    if (!appSecret) return "bridge_feishu_app_secret not configured";
 
     return null;
   }
 
   isAuthorized(userId: string, chatId: string): boolean {
-    const allowedUsers = getBridgeContext().store.getSetting('bridge_feishu_allowed_users') || '';
+    const allowedUsers =
+      getBridgeContext().store.getSetting("bridge_feishu_allowed_users") || "";
     if (!allowedUsers) {
       // No restriction configured — allow all
       return true;
     }
 
     const allowed = allowedUsers
-      .split(',')
+      .split(",")
       .map((s) => s.trim())
       .filter(Boolean);
 
@@ -486,23 +551,27 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
   // ── Incoming event handler ──────────────────────────────────
 
-  private async handleIncomingEvent(data: FeishuMessageEventData): Promise<void> {
+  private async handleIncomingEvent(
+    data: FeishuMessageEventData,
+  ): Promise<void> {
     try {
       await this.processIncomingEvent(data);
     } catch (err) {
       console.error(
-        '[feishu-adapter] Unhandled error in event handler:',
+        "[feishu-adapter] Unhandled error in event handler:",
         err instanceof Error ? err.stack || err.message : err,
       );
     }
   }
 
-  private async processIncomingEvent(data: FeishuMessageEventData): Promise<void> {
+  private async processIncomingEvent(
+    data: FeishuMessageEventData,
+  ): Promise<void> {
     const msg = data.message;
     const sender = data.sender;
 
     // [P1] Filter out bot messages to prevent self-triggering loops
-    if (sender.sender_type === 'bot') return;
+    if (sender.sender_type === "bot") return;
 
     // Dedup by message_id
     if (this.seenMessageIds.has(msg.message_id)) return;
@@ -510,51 +579,79 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     const chatId = msg.chat_id;
     // [P2] Complete sender ID fallback chain: open_id > user_id > union_id
-    const userId = sender.sender_id?.open_id
-      || sender.sender_id?.user_id
-      || sender.sender_id?.union_id
-      || '';
-    const isGroup = msg.chat_type === 'group';
+    const userId =
+      sender.sender_id?.open_id ||
+      sender.sender_id?.user_id ||
+      sender.sender_id?.union_id ||
+      "";
+    const isGroup = msg.chat_type === "group";
 
     // Authorization check
     if (!this.isAuthorized(userId, chatId)) {
-      console.warn('[feishu-adapter] Unauthorized message from userId:', userId, 'chatId:', chatId);
+      console.warn(
+        "[feishu-adapter] Unauthorized message from userId:",
+        userId,
+        "chatId:",
+        chatId,
+      );
       return;
     }
 
     // Group chat policy
     if (isGroup) {
-      const policy = getBridgeContext().store.getSetting('bridge_feishu_group_policy') || 'open';
+      const policy =
+        getBridgeContext().store.getSetting("bridge_feishu_group_policy") ||
+        "open";
 
-      if (policy === 'disabled') {
-        console.log('[feishu-adapter] Group message ignored (policy=disabled), chatId:', chatId);
+      if (policy === "disabled") {
+        console.log(
+          "[feishu-adapter] Group message ignored (policy=disabled), chatId:",
+          chatId,
+        );
         return;
       }
 
-      if (policy === 'allowlist') {
-        const allowedGroups = (getBridgeContext().store.getSetting('bridge_feishu_group_allow_from') || '')
-          .split(',')
+      if (policy === "allowlist") {
+        const allowedGroups = (
+          getBridgeContext().store.getSetting(
+            "bridge_feishu_group_allow_from",
+          ) || ""
+        )
+          .split(",")
           .map((s) => s.trim())
           .filter(Boolean);
         if (!allowedGroups.includes(chatId)) {
-          console.log('[feishu-adapter] Group message ignored (not in allowlist), chatId:', chatId);
+          console.log(
+            "[feishu-adapter] Group message ignored (not in allowlist), chatId:",
+            chatId,
+          );
           return;
         }
       }
 
       // Require @mention check
-      const requireMention = getBridgeContext().store.getSetting('bridge_feishu_require_mention') !== 'false';
+      const requireMention =
+        getBridgeContext().store.getSetting("bridge_feishu_require_mention") !==
+        "false";
       if (requireMention && !this.isBotMentioned(msg.mentions)) {
-        console.log('[feishu-adapter] Group message ignored (bot not @mentioned), chatId:', chatId, 'msgId:', msg.message_id);
+        console.log(
+          "[feishu-adapter] Group message ignored (bot not @mentioned), chatId:",
+          chatId,
+          "msgId:",
+          msg.message_id,
+        );
         try {
           getBridgeContext().store.insertAuditLog({
-            channelType: 'feishu',
+            channelType: "feishu",
             chatId,
-            direction: 'inbound',
+            direction: "inbound",
             messageId: msg.message_id,
-            summary: '[FILTERED] Group message dropped: bot not @mentioned (require_mention=true)',
+            summary:
+              "[FILTERED] Group message dropped: bot not @mentioned (require_mention=true)",
           });
-        } catch { /* best effort */ }
+        } catch {
+          /* best effort */
+        }
         return;
       }
     }
@@ -564,62 +661,89 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     // Extract content based on message type
     const messageType = msg.message_type;
-    let text = '';
+    let text = "";
     const attachments: FileAttachment[] = [];
 
-    if (messageType === 'text') {
+    if (messageType === "text") {
       text = this.parseTextContent(msg.content);
-    } else if (messageType === 'image') {
+    } else if (messageType === "image") {
       // [P1] Download image with failure fallback
-      console.log('[feishu-adapter] Image message received, content:', msg.content);
+      console.log(
+        "[feishu-adapter] Image message received, content:",
+        msg.content,
+      );
       const fileKey = this.extractFileKey(msg.content);
-      console.log('[feishu-adapter] Extracted fileKey:', fileKey);
+      console.log("[feishu-adapter] Extracted fileKey:", fileKey);
       if (fileKey) {
-        const attachment = await this.downloadResource(msg.message_id, fileKey, 'image');
+        const attachment = await this.downloadResource(
+          msg.message_id,
+          fileKey,
+          "image",
+        );
         if (attachment) {
           attachments.push(attachment);
         } else {
-          text = '[image download failed]';
+          text = "[image download failed]";
           try {
             getBridgeContext().store.insertAuditLog({
-              channelType: 'feishu',
+              channelType: "feishu",
               chatId,
-              direction: 'inbound',
+              direction: "inbound",
               messageId: msg.message_id,
               summary: `[ERROR] Image download failed for key: ${fileKey}`,
             });
-          } catch { /* best effort */ }
+          } catch {
+            /* best effort */
+          }
         }
       }
-    } else if (messageType === 'file' || messageType === 'audio' || messageType === 'video' || messageType === 'media') {
+    } else if (
+      messageType === "file" ||
+      messageType === "audio" ||
+      messageType === "video" ||
+      messageType === "media"
+    ) {
       // [P2] Support file/audio/video/media downloads
       const fileKey = this.extractFileKey(msg.content);
       if (fileKey) {
-        const resourceType = messageType === 'audio' || messageType === 'video' || messageType === 'media'
-          ? messageType
-          : 'file';
-        const attachment = await this.downloadResource(msg.message_id, fileKey, resourceType);
+        const resourceType =
+          messageType === "audio" ||
+          messageType === "video" ||
+          messageType === "media"
+            ? messageType
+            : "file";
+        const attachment = await this.downloadResource(
+          msg.message_id,
+          fileKey,
+          resourceType,
+        );
         if (attachment) {
           attachments.push(attachment);
         } else {
           text = `[${messageType} download failed]`;
           try {
             getBridgeContext().store.insertAuditLog({
-              channelType: 'feishu',
+              channelType: "feishu",
               chatId,
-              direction: 'inbound',
+              direction: "inbound",
               messageId: msg.message_id,
               summary: `[ERROR] ${messageType} download failed for key: ${fileKey}`,
             });
-          } catch { /* best effort */ }
+          } catch {
+            /* best effort */
+          }
         }
       }
-    } else if (messageType === 'post') {
+    } else if (messageType === "post") {
       // [P2] Extract text and image keys from rich text (post) messages
       const { extractedText, imageKeys } = this.parsePostContent(msg.content);
       text = extractedText;
       for (const key of imageKeys) {
-        const attachment = await this.downloadResource(msg.message_id, key, 'image');
+        const attachment = await this.downloadResource(
+          msg.message_id,
+          key,
+          "image",
+        );
         if (attachment) {
           attachments.push(attachment);
         }
@@ -627,7 +751,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
       }
     } else {
       // Unsupported type — log and skip
-      console.log(`[feishu-adapter] Unsupported message type: ${messageType}, msgId: ${msg.message_id}`);
+      console.log(
+        `[feishu-adapter] Unsupported message type: ${messageType}, msgId: ${msg.message_id}`,
+      );
       return;
     }
 
@@ -638,19 +764,19 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     const timestamp = parseInt(msg.create_time, 10) || Date.now();
     const address = {
-      channelType: 'feishu' as const,
+      channelType: "feishu" as const,
       chatId,
       userId,
     };
 
     // [P1] Check for /perm text command (permission approval fallback)
     const trimmedText = text.trim();
-    if (trimmedText.startsWith('/perm ')) {
+    if (trimmedText.startsWith("/perm ")) {
       const permParts = trimmedText.split(/\s+/);
       // /perm <action> <permId>
       if (permParts.length >= 3) {
         const action = permParts[1]; // allow / allow_session / deny
-        const permId = permParts.slice(2).join(' ');
+        const permId = permParts.slice(2).join(" ");
         const callbackData = `perm:${action}:${permId}`;
 
         const inbound: InboundMessage = {
@@ -675,17 +801,20 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     // Audit log
     try {
-      const summary = attachments.length > 0
-        ? `[${attachments.length} attachment(s)] ${text.slice(0, 150)}`
-        : text.slice(0, 200);
+      const summary =
+        attachments.length > 0
+          ? `[${attachments.length} attachment(s)] ${text.slice(0, 150)}`
+          : text.slice(0, 200);
       getBridgeContext().store.insertAuditLog({
-        channelType: 'feishu',
+        channelType: "feishu",
         chatId,
-        direction: 'inbound',
+        direction: "inbound",
         messageId: msg.message_id,
         summary,
       });
-    } catch { /* best effort */ }
+    } catch {
+      /* best effort */
+    }
 
     this.enqueue(inbound);
   }
@@ -695,7 +824,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private parseTextContent(content: string): string {
     try {
       const parsed = JSON.parse(content);
-      return parsed.text || '';
+      return parsed.text || "";
     } catch {
       return content;
     }
@@ -708,7 +837,13 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private extractFileKey(content: string): string | null {
     try {
       const parsed = JSON.parse(content);
-      return parsed.image_key || parsed.file_key || parsed.imageKey || parsed.fileKey || null;
+      return (
+        parsed.image_key ||
+        parsed.file_key ||
+        parsed.imageKey ||
+        parsed.fileKey ||
+        null
+      );
     } catch {
       return null;
     }
@@ -718,7 +853,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
    * Parse rich text (post) content.
    * Extracts plain text from text elements and image keys from img elements.
    */
-  private parsePostContent(content: string): { extractedText: string; imageKeys: string[] } {
+  private parsePostContent(content: string): {
+    extractedText: string;
+    imageKeys: string[];
+  } {
     const imageKeys: string[] = [];
     const textParts: string[] = [];
 
@@ -733,25 +871,26 @@ export class FeishuAdapter extends BaseChannelAdapter {
         for (const paragraph of paragraphs) {
           if (!Array.isArray(paragraph)) continue;
           for (const element of paragraph) {
-            if (element.tag === 'text' && element.text) {
+            if (element.tag === "text" && element.text) {
               textParts.push(element.text);
-            } else if (element.tag === 'a' && element.text) {
+            } else if (element.tag === "a" && element.text) {
               textParts.push(element.text);
-            } else if (element.tag === 'at' && element.user_id) {
+            } else if (element.tag === "at" && element.user_id) {
               // Mention in post — handled by isBotMentioned for group policy
-            } else if (element.tag === 'img') {
-              const key = element.image_key || element.file_key || element.imageKey;
+            } else if (element.tag === "img") {
+              const key =
+                element.image_key || element.file_key || element.imageKey;
               if (key) imageKeys.push(key);
             }
           }
-          textParts.push('\n');
+          textParts.push("\n");
         }
       }
     } catch {
       // Failed to parse post content
     }
 
-    return { extractedText: textParts.join('').trim(), imageKeys };
+    return { extractedText: textParts.join("").trim(), imageKeys };
   }
 
   // ── Bot identity ────────────────────────────────────────────
@@ -766,24 +905,28 @@ export class FeishuAdapter extends BaseChannelAdapter {
     domain: lark.Domain,
   ): Promise<void> {
     try {
-      const baseUrl = domain === lark.Domain.Lark
-        ? 'https://open.larksuite.com'
-        : 'https://open.feishu.cn';
+      const baseUrl =
+        domain === lark.Domain.Lark
+          ? "https://open.larksuite.com"
+          : "https://open.feishu.cn";
 
-      const tokenRes = await fetch(`${baseUrl}/open-apis/auth/v3/tenant_access_token/internal`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
-        signal: AbortSignal.timeout(10_000),
-      });
+      const tokenRes = await fetch(
+        `${baseUrl}/open-apis/auth/v3/tenant_access_token/internal`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
+          signal: AbortSignal.timeout(10_000),
+        },
+      );
       const tokenData: any = await tokenRes.json();
       if (!tokenData.tenant_access_token) {
-        console.warn('[feishu-adapter] Failed to get tenant access token');
+        console.warn("[feishu-adapter] Failed to get tenant access token");
         return;
       }
 
       const botRes = await fetch(`${baseUrl}/open-apis/bot/v3/info/`, {
-        method: 'GET',
+        method: "GET",
         headers: { Authorization: `Bearer ${tokenData.tenant_access_token}` },
         signal: AbortSignal.timeout(10_000),
       });
@@ -797,11 +940,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
         this.botIds.add(botData.bot.bot_id);
       }
       if (!this.botOpenId) {
-        console.warn('[feishu-adapter] Could not resolve bot open_id');
+        console.warn("[feishu-adapter] Could not resolve bot open_id");
       }
     } catch (err) {
       console.warn(
-        '[feishu-adapter] Failed to resolve bot identity:',
+        "[feishu-adapter] Failed to resolve bot identity:",
         err instanceof Error ? err.message : err,
       );
     }
@@ -813,18 +956,20 @@ export class FeishuAdapter extends BaseChannelAdapter {
    * [P2] Check if bot is mentioned — matches against open_id, user_id, union_id.
    */
   private isBotMentioned(
-    mentions?: FeishuMessageEventData['message']['mentions'],
+    mentions?: FeishuMessageEventData["message"]["mentions"],
   ): boolean {
     if (!mentions || this.botIds.size === 0) return false;
     return mentions.some((m) => {
-      const ids = [m.id.open_id, m.id.user_id, m.id.union_id].filter(Boolean) as string[];
+      const ids = [m.id.open_id, m.id.user_id, m.id.union_id].filter(
+        Boolean,
+      ) as string[];
       return ids.some((id) => this.botIds.has(id));
     });
   }
 
   private stripMentionMarkers(text: string): string {
     // Feishu uses @_user_N placeholders for mentions
-    return text.replace(/@_user_\d+/g, '').trim();
+    return text.replace(/@_user_\d+/g, "").trim();
   }
 
   // ── Resource download ───────────────────────────────────────
@@ -841,7 +986,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
     if (!this.restClient) return null;
 
     try {
-      console.log(`[feishu-adapter] Downloading resource: type=${resourceType}, key=${fileKey}, msgId=${messageId}`);
+      console.log(
+        `[feishu-adapter] Downloading resource: type=${resourceType}, key=${fileKey}, msgId=${messageId}`,
+      );
 
       const res = await this.restClient.im.messageResource.get({
         path: {
@@ -849,12 +996,14 @@ export class FeishuAdapter extends BaseChannelAdapter {
           file_key: fileKey,
         },
         params: {
-          type: resourceType === 'image' ? 'image' : 'file',
+          type: resourceType === "image" ? "image" : "file",
         },
       });
 
       if (!res) {
-        console.warn('[feishu-adapter] messageResource.get returned null/undefined');
+        console.warn(
+          "[feishu-adapter] messageResource.get returned null/undefined",
+        );
         return null;
       }
 
@@ -871,7 +1020,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
           const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
           totalSize += buf.length;
           if (totalSize > MAX_FILE_SIZE) {
-            console.warn(`[feishu-adapter] Resource too large (>${MAX_FILE_SIZE} bytes), key: ${fileKey}`);
+            console.warn(
+              `[feishu-adapter] Resource too large (>${MAX_FILE_SIZE} bytes), key: ${fileKey}`,
+            );
             return null;
           }
           chunks.push(buf);
@@ -879,38 +1030,59 @@ export class FeishuAdapter extends BaseChannelAdapter {
         buffer = Buffer.concat(chunks);
       } catch (streamErr) {
         // Stream approach failed — fall back to writeFile + read
-        console.warn('[feishu-adapter] Stream read failed, falling back to writeFile:', streamErr instanceof Error ? streamErr.message : streamErr);
+        console.warn(
+          "[feishu-adapter] Stream read failed, falling back to writeFile:",
+          streamErr instanceof Error ? streamErr.message : streamErr,
+        );
 
-        const fs = await import('fs');
-        const os = await import('os');
-        const path = await import('path');
-        const tmpPath = path.join(os.tmpdir(), `feishu-dl-${crypto.randomUUID()}`);
+        const fs = await import("fs");
+        const os = await import("os");
+        const path = await import("path");
+        const tmpPath = path.join(
+          os.tmpdir(),
+          `feishu-dl-${crypto.randomUUID()}`,
+        );
         try {
           await res.writeFile(tmpPath);
           buffer = fs.readFileSync(tmpPath);
           if (buffer.length > MAX_FILE_SIZE) {
-            console.warn(`[feishu-adapter] Resource too large (>${MAX_FILE_SIZE} bytes), key: ${fileKey}`);
+            console.warn(
+              `[feishu-adapter] Resource too large (>${MAX_FILE_SIZE} bytes), key: ${fileKey}`,
+            );
             return null;
           }
         } finally {
-          try { fs.unlinkSync(tmpPath); } catch { /* ignore cleanup errors */ }
+          try {
+            fs.unlinkSync(tmpPath);
+          } catch {
+            /* ignore cleanup errors */
+          }
         }
       }
 
       if (!buffer || buffer.length === 0) {
-        console.warn('[feishu-adapter] Downloaded resource is empty, key:', fileKey);
+        console.warn(
+          "[feishu-adapter] Downloaded resource is empty, key:",
+          fileKey,
+        );
         return null;
       }
 
-      const base64 = buffer.toString('base64');
+      const base64 = buffer.toString("base64");
       const id = crypto.randomUUID();
-      const mimeType = MIME_BY_TYPE[resourceType] || 'application/octet-stream';
-      const ext = resourceType === 'image' ? 'png'
-        : resourceType === 'audio' ? 'ogg'
-        : resourceType === 'video' ? 'mp4'
-        : 'bin';
+      const mimeType = MIME_BY_TYPE[resourceType] || "application/octet-stream";
+      const ext =
+        resourceType === "image"
+          ? "png"
+          : resourceType === "audio"
+            ? "ogg"
+            : resourceType === "video"
+              ? "mp4"
+              : "bin";
 
-      console.log(`[feishu-adapter] Resource downloaded: ${buffer.length} bytes, key=${fileKey}`);
+      console.log(
+        `[feishu-adapter] Resource downloaded: ${buffer.length} bytes, key=${fileKey}`,
+      );
 
       return {
         id,
@@ -938,6 +1110,145 @@ export class FeishuAdapter extends BaseChannelAdapter {
     return this.restClient;
   }
 
+  // ── Streaming card (preview / deliverFinal) ─────────────────
+
+  getPreviewCapabilities(
+    _chatId: string,
+  ): import("../types.js").PreviewCapabilities | null {
+    if (!this.restClient) return null;
+    return { supported: true, privateOnly: false };
+  }
+
+  async sendPreview(
+    chatId: string,
+    text: string,
+    draftId: number,
+  ): Promise<"sent" | "skip" | "degrade"> {
+    if (!this.restClient) return "skip";
+
+    const key = `${chatId}:${draftId}`;
+
+    // 首次调用：创建卡片
+    if (!this.streamingCards.has(key)) {
+      const cardId = await createStreamingCard(this.restClient);
+      if (!cardId) return "degrade"; // 创建失败，降级到普通消息
+
+      // 获取最近收到的消息 ID 用于回复
+      const replyToId = this.lastIncomingMessageId.get(chatId);
+      const messageId = await sendCardMessage(
+        this.restClient,
+        chatId,
+        cardId,
+        replyToId,
+      );
+      if (!messageId) return "degrade";
+
+      this.streamingCards.set(key, {
+        cardId,
+        messageId,
+        sequence: 0,
+        startTime: Date.now(),
+        pendingText: "",
+        throttleTimer: null,
+      });
+    }
+
+    const state = this.streamingCards.get(key)!;
+    state.pendingText = text;
+
+    // 内部 300ms 防抖
+    if (state.throttleTimer) {
+      clearTimeout(state.throttleTimer);
+    }
+    state.throttleTimer = setTimeout(() => {
+      state.throttleTimer = null;
+      if (!this.restClient) return;
+      state.sequence++;
+      streamContent(
+        this.restClient,
+        state.cardId,
+        state.pendingText,
+        state.sequence,
+      );
+    }, 300);
+
+    return "sent";
+  }
+
+  async deliverFinal(
+    address: import("../types.js").ChannelAddress,
+    responseText: string,
+    _sessionId: string,
+  ): Promise<import("../types.js").SendResult> {
+    const chatId = address.chatId;
+
+    // 找到该 chatId 的活跃 streaming card
+    let activeKey: string | null = null;
+    for (const [key] of this.streamingCards) {
+      if (key.startsWith(chatId + ":")) {
+        activeKey = key;
+        break;
+      }
+    }
+
+    if (!activeKey || !this.restClient) {
+      // 降级：无活跃 card 或 client 不可用，走默认发新消息逻辑
+      return this.send({
+        address,
+        text: responseText,
+        parseMode: "Markdown",
+      });
+    }
+
+    const state = this.streamingCards.get(activeKey)!;
+
+    // 清理 throttle timer
+    if (state.throttleTimer) {
+      clearTimeout(state.throttleTimer);
+      state.throttleTimer = null;
+    }
+
+    // 构建最终卡片
+    const elapsed = Date.now() - state.startTime;
+    const finalJson = buildFinalCardJson(responseText, { elapsed });
+
+    // 关闭流式 + 全量替换
+    state.sequence++;
+    const ok = await finalizeCard(
+      this.restClient,
+      state.cardId,
+      finalJson,
+      state.sequence,
+    );
+
+    // 清理状态
+    this.streamingCards.delete(activeKey);
+
+    if (!ok) {
+      // finalize 失败，降级发新消息
+      console.warn(
+        "[feishu-adapter] deliverFinal: card finalize failed, falling back to new message",
+      );
+      return this.send({
+        address,
+        text: responseText,
+        parseMode: "Markdown",
+      });
+    }
+
+    return { ok: true };
+  }
+
+  endPreview(chatId: string, draftId: number): void {
+    const key = `${chatId}:${draftId}`;
+    const state = this.streamingCards.get(key);
+    if (state?.throttleTimer) {
+      clearTimeout(state.throttleTimer);
+    }
+    // defensive cleanup（deliverFinal 可能已经删了，这里兜底）
+    this.streamingCards.delete(key);
+  }
+
   // ── Utilities ───────────────────────────────────────────────
 
   private addToDedup(messageId: string): void {
@@ -957,4 +1268,4 @@ export class FeishuAdapter extends BaseChannelAdapter {
 }
 
 // Self-register so bridge-manager can create FeishuAdapter via the registry.
-registerAdapterFactory('feishu', () => new FeishuAdapter());
+registerAdapterFactory("feishu", () => new FeishuAdapter());
