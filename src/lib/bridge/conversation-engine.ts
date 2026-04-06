@@ -43,7 +43,57 @@ export type OnPartialText = (fullText: string) => void;
  * Callback invoked when tool_use or tool_result SSE events arrive.
  * Used by bridge-manager to forward tool progress to adapters for real-time display.
  */
-export type OnToolEvent = (toolId: string, toolName: string, status: 'running' | 'complete' | 'error') => void;
+export type OnToolEvent = (toolId: string, toolName: string, status: 'running' | 'complete' | 'error', description?: string) => void;
+
+/**
+ * Extract a human-readable description from tool input based on tool type.
+ * Falls back to tool name if no meaningful description can be derived.
+ */
+function extractToolDescription(toolName: string, input?: Record<string, unknown>): string | undefined {
+  if (!input) return undefined;
+  // Bash / TaskCreate / TaskUpdate — have explicit description or activeForm
+  if (input.description && typeof input.description === 'string') return input.description;
+  if (input.activeForm && typeof input.activeForm === 'string') return input.activeForm;
+  // Read — show shortened file path
+  if (toolName === 'Read' && typeof input.file_path === 'string') {
+    const parts = (input.file_path as string).split('/');
+    return `读取 ${parts.slice(-2).join('/')}`;
+  }
+  // Write — show shortened file path
+  if (toolName === 'Write' && typeof input.file_path === 'string') {
+    const parts = (input.file_path as string).split('/');
+    return `写入 ${parts.slice(-2).join('/')}`;
+  }
+  // Edit — show shortened file path
+  if (toolName === 'Edit' && typeof input.file_path === 'string') {
+    const parts = (input.file_path as string).split('/');
+    return `编辑 ${parts.slice(-2).join('/')}`;
+  }
+  // Glob — show pattern
+  if (toolName === 'Glob' && typeof input.pattern === 'string') {
+    return `搜索文件 ${input.pattern}`;
+  }
+  // Grep — show pattern
+  if (toolName === 'Grep' && typeof input.pattern === 'string') {
+    return `搜索内容 ${input.pattern}`;
+  }
+  // Agent — show description
+  if (toolName === 'Agent' && typeof input.description === 'string') {
+    return input.description;
+  }
+  // WebSearch / WebFetch
+  if (toolName === 'WebSearch' && typeof input.query === 'string') {
+    return `搜索 ${input.query}`;
+  }
+  if (toolName === 'WebFetch' && typeof input.url === 'string') {
+    return `获取网页`;
+  }
+  // Skill
+  if (toolName === 'Skill' && typeof input.skill === 'string') {
+    return `执行 ${input.skill}`;
+  }
+  return undefined;
+}
 
 export interface ConversationResult {
   responseText: string;
@@ -255,7 +305,8 @@ async function consumeStream(
                 input: toolData.input,
               });
               if (onToolEvent) {
-                try { onToolEvent(toolData.id, toolData.name, 'running'); } catch { /* non-critical */ }
+                const desc = extractToolDescription(toolData.name, toolData.input);
+                try { onToolEvent(toolData.id, toolData.name, 'running', desc); } catch { /* non-critical */ }
               }
             } catch { /* skip */ }
             break;

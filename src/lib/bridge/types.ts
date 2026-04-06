@@ -174,6 +174,8 @@ export interface ToolCallInfo {
   id: string;
   name: string;
   status: 'running' | 'complete' | 'error';
+  /** Human-readable step description from tool input (e.g. Bash description). */
+  description?: string;
 }
 
 // ── Config ─────────────────────────────────────────────────────

@@ -92,16 +92,29 @@ export function htmlToFeishuMarkdown(html: string): string {
 }
 
 /**
- * Build tool progress markdown lines.
- * Each tool shows an icon based on status: 🔄 Running, ✅ Complete, ❌ Error.
+ * Build tool progress markdown for streaming cards.
+ * Shows only what the user needs: current step + a simple "working" indicator.
+ * No step counts (total is unknown and keeps changing).
+ *
+ * During execution:  🔄 读取文件...
+ * All tools done:    📝 整理回复中...
+ * For final card:    (empty — clean result)
  */
-export function buildToolProgressMarkdown(tools: ToolCallInfo[]): string {
+export function buildToolProgressMarkdown(tools: ToolCallInfo[], isFinal?: boolean): string {
   if (tools.length === 0) return '';
-  const lines = tools.map((tc) => {
-    const icon = tc.status === 'running' ? '🔄' : tc.status === 'complete' ? '✅' : '❌';
-    return `${icon} \`${tc.name}\``;
-  });
-  return lines.join('\n');
+  if (isFinal) return '';
+
+  const running = tools.filter((t) => t.status === 'running');
+
+  // No tools running — either all done or only errors (which are internal retries)
+  if (running.length === 0) {
+    return '📝 整理回复中...';
+  }
+
+  // Show only the current (latest) running step — no error display (errors are internal retries)
+  const current = running[running.length - 1];
+  const label = current.description || current.name;
+  return `🔄 ${label}`;
 }
 
 /**
@@ -117,16 +130,22 @@ export function formatElapsed(ms: number): string {
 }
 
 /**
- * Build the body elements array for a streaming card update.
- * Combines main text content with tool progress.
+ * Build streaming card content.
+ * Text always preserved. Progress shown below separator when tools are active.
+ * Returns { content, showCursor }.
  */
-export function buildStreamingContent(text: string, tools: ToolCallInfo[]): string {
-  let content = text || '';
+export function buildStreamingContent(text: string, tools: ToolCallInfo[]): { content: string; showCursor: boolean } {
   const toolMd = buildToolProgressMarkdown(tools);
+  let content = text || '';
+
   if (toolMd) {
-    content = content ? `${content}\n\n${toolMd}` : toolMd;
+    // Tools active — show text + progress below separator, no cursor
+    content = content ? `${content}\n\n---\n${toolMd}` : toolMd;
+    return { content, showCursor: false };
   }
-  return content || '💭 Thinking...';
+
+  // No tools or all done — pure text streaming with cursor
+  return { content: content || '💭 Thinking...', showCursor: true };
 }
 
 /**
@@ -139,12 +158,8 @@ export function buildFinalCardJson(
 ): string {
   const elements: Array<Record<string, unknown>> = [];
 
-  // Main text content
-  let content = preprocessFeishuMarkdown(text);
-  const toolMd = buildToolProgressMarkdown(tools);
-  if (toolMd) {
-    content = content ? `${content}\n\n${toolMd}` : toolMd;
-  }
+  // Main text content — final card hides tool progress (isFinal=true)
+  const content = preprocessFeishuMarkdown(text);
 
   if (content) {
     elements.push({

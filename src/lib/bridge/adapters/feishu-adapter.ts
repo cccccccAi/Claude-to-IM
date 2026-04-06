@@ -48,11 +48,9 @@ const MAX_FILE_SIZE = 20 * 1024 * 1024;
 /** Feishu emoji type for typing indicator (same as Openclaw). */
 const TYPING_EMOJI = 'Typing';
 
-/** State for an active CardKit v2 streaming card. */
+/** State for an active streaming card (im.message.patch approach). */
 interface FeishuCardState {
-  cardId: string;
   messageId: string;
-  sequence: number;
   startTime: number;
   toolCalls: ToolCallInfo[];
   thinking: boolean;
@@ -61,8 +59,8 @@ interface FeishuCardState {
   throttleTimer: ReturnType<typeof setTimeout> | null;
 }
 
-/** Streaming card throttle interval (ms). */
-const CARD_THROTTLE_MS = 200;
+/** Streaming card throttle interval (ms). Feishu rate-limits card patches; 500ms avoids 230020 errors. */
+const CARD_THROTTLE_MS = 500;
 
 /** Shape of the SDK's im.message.receive_v1 event data. */
 type FeishuMessageEventData = {
@@ -351,16 +349,15 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
   }
 
-  // ── Streaming Card (CardKit v2) ────────────────────────────────
+  // ── Streaming Card (im.message.patch approach, DeerFlow pattern) ─
 
   /**
    * Create a new streaming card and send it as a message.
-   * Returns true if card was created successfully.
+   * Uses im.message.create with update_multi: true, then patches in place.
    */
   private createStreamingCard(chatId: string, replyToMessageId?: string): Promise<boolean> {
     if (!this.restClient || this.activeCards.has(chatId)) return Promise.resolve(false);
 
-    // In-flight guard: if creation is already in progress, return the existing promise
     const existing = this.cardCreatePromises.get(chatId);
     if (existing) return existing;
 
@@ -370,68 +367,37 @@ export class FeishuAdapter extends BaseChannelAdapter {
     return promise;
   }
 
-  private async _doCreateStreamingCard(chatId: string, replyToMessageId?: string): Promise<boolean> {
+  private async _doCreateStreamingCard(chatId: string, _replyToMessageId?: string): Promise<boolean> {
     if (!this.restClient) return false;
 
     try {
-      // Step 1: Create card via CardKit v2
-      const cardBody = {
+      const cardJson = JSON.stringify({
         schema: '2.0',
-        config: {
-          streaming_mode: true,
-          wide_screen_mode: true,
-          summary: { content: '思考中...' },
-        },
+        config: { wide_screen_mode: true, update_multi: true },
         body: {
-          elements: [{
-            tag: 'markdown',
-            content: '💭 Thinking...',
-            text_align: 'left',
-            text_size: 'normal',
-            element_id: 'streaming_content',
-          }],
+          elements: [
+            { tag: 'markdown', content: '💭 Thinking...\n\n`▍`' },
+          ],
         },
-      };
-
-      const createResp = await (this.restClient as any).cardkit.v2.card.create({
-        data: { type: 'card_json', data: JSON.stringify(cardBody) },
       });
-      const cardId = createResp?.data?.card_id;
-      if (!cardId) {
-        console.warn('[feishu-adapter] Card create returned no card_id');
-        return false;
-      }
 
-      // Step 2: Send card as IM message
-      const cardContent = JSON.stringify({ type: 'card', data: { card_id: cardId } });
-      let msgResp;
-      if (replyToMessageId) {
-        msgResp = await this.restClient.im.message.reply({
-          path: { message_id: replyToMessageId },
-          data: { content: cardContent, msg_type: 'interactive' },
-        });
-      } else {
-        msgResp = await this.restClient.im.message.create({
-          params: { receive_id_type: 'chat_id' },
-          data: {
-            receive_id: chatId,
-            msg_type: 'interactive',
-            content: cardContent,
-          },
-        });
-      }
+      const res = await this.restClient.im.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: {
+          receive_id: chatId,
+          msg_type: 'interactive',
+          content: cardJson,
+        },
+      });
 
-      const messageId = msgResp?.data?.message_id;
+      const messageId = res?.data?.message_id;
       if (!messageId) {
-        console.warn('[feishu-adapter] Card message send returned no message_id');
+        console.warn('[feishu-adapter] Streaming card create returned no message_id');
         return false;
       }
 
-      // Store card state
       this.activeCards.set(chatId, {
-        cardId,
         messageId,
-        sequence: 0,
         startTime: Date.now(),
         toolCalls: [],
         thinking: true,
@@ -440,7 +406,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
         throttleTimer: null,
       });
 
-      console.log(`[feishu-adapter] Streaming card created: cardId=${cardId}, msgId=${messageId}`);
+      console.log(`[feishu-adapter] Streaming card created: msgId=${messageId}`);
       return true;
     } catch (err) {
       console.warn('[feishu-adapter] Failed to create streaming card:', err instanceof Error ? err.message : err);
@@ -482,26 +448,33 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   /**
-   * Flush pending card update to Feishu API.
+   * Flush pending card update via im.message.patch (DeerFlow pattern).
    */
   private flushCardUpdate(chatId: string): void {
     const state = this.activeCards.get(chatId);
     if (!state || !this.restClient) return;
 
-    const content = buildStreamingContent(state.pendingText || '', state.toolCalls);
+    const { content, showCursor } = buildStreamingContent(state.pendingText || '', state.toolCalls);
+    const cursor = showCursor ? '\n\n`▍`' : '';
 
-    state.sequence++;
-    const seq = state.sequence;
-    const cardId = state.cardId;
+    const cardJson = JSON.stringify({
+      schema: '2.0',
+      config: { wide_screen_mode: true, update_multi: true },
+      body: {
+        elements: [
+          { tag: 'markdown', content: content + cursor },
+        ],
+      },
+    });
 
     // Fire-and-forget — streaming updates are non-critical
-    (this.restClient as any).cardkit.v2.card.streamContent({
-      path: { card_id: cardId },
-      data: { content, sequence: seq },
+    this.restClient.im.message.patch({
+      path: { message_id: state.messageId },
+      data: { content: cardJson },
     }).then(() => {
       state.lastUpdateAt = Date.now();
     }).catch((err: unknown) => {
-      console.warn('[feishu-adapter] streamContent failed:', err instanceof Error ? err.message : err);
+      console.warn('[feishu-adapter] patch failed:', err instanceof Error ? err.message : err);
     });
   }
 
@@ -517,14 +490,13 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   /**
-   * Finalize the streaming card: close streaming mode, update with final content + footer.
+   * Finalize the streaming card: patch with final content + footer.
    */
   private async finalizeCard(
     chatId: string,
     status: 'completed' | 'interrupted' | 'error',
     responseText: string,
   ): Promise<boolean> {
-    // Wait for in-flight card creation to complete before finalizing
     const pending = this.cardCreatePromises.get(chatId);
     if (pending) {
       try { await pending; } catch { /* creation failed — no card to finalize */ }
@@ -533,41 +505,44 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const state = this.activeCards.get(chatId);
     if (!state || !this.restClient) return false;
 
-    // Clear any pending throttle timer
     if (state.throttleTimer) {
       clearTimeout(state.throttleTimer);
       state.throttleTimer = null;
     }
 
-    try {
-      // Step 1: Close streaming mode
-      state.sequence++;
-      await (this.restClient as any).cardkit.v2.card.settings.streamingMode.set({
-        path: { card_id: state.cardId },
-        data: { streaming_mode: false, sequence: state.sequence },
-      });
+    // Wait for any in-flight patch to settle before finalizing
+    // This prevents a race where a fire-and-forget flush arrives after finalize
+    await new Promise((r) => setTimeout(r, 600));
 
-      // Step 2: Build and apply final card
+    try {
       const statusLabels: Record<string, string> = {
-        completed: '✅ Completed',
+        completed: '✅',
         interrupted: '⚠️ Interrupted',
         error: '❌ Error',
       };
       const elapsedMs = Date.now() - state.startTime;
-      const footer = {
-        status: statusLabels[status] || status,
-        elapsed: formatElapsed(elapsedMs),
-      };
+      const statusText = statusLabels[status] || status;
+      const elapsed = formatElapsed(elapsedMs);
 
-      const finalCardJson = buildFinalCardJson(responseText, state.toolCalls, footer);
+      const finalContent = preprocessFeishuMarkdown(responseText);
+      const footerLine = `\n\n---\n${statusText} · ${elapsed}`;
 
-      state.sequence++;
-      await (this.restClient as any).cardkit.v2.card.update({
-        path: { card_id: state.cardId },
-        data: { type: 'card_json', data: finalCardJson, sequence: state.sequence },
+      const cardJson = JSON.stringify({
+        schema: '2.0',
+        config: { wide_screen_mode: true, update_multi: true },
+        body: {
+          elements: [
+            { tag: 'markdown', content: finalContent + footerLine },
+          ],
+        },
       });
 
-      console.log(`[feishu-adapter] Card finalized: cardId=${state.cardId}, status=${status}, elapsed=${formatElapsed(elapsedMs)}`);
+      await this.restClient.im.message.patch({
+        path: { message_id: state.messageId },
+        data: { content: cardJson },
+      });
+
+      console.log(`[feishu-adapter] Card finalized: msgId=${state.messageId}, status=${status}, elapsed=${elapsed}`);
       return true;
     } catch (err) {
       console.warn('[feishu-adapter] Card finalize failed:', err instanceof Error ? err.message : err);
