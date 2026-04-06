@@ -18,6 +18,40 @@ import type {
 import { getBridgeContext } from './context.js';
 import crypto from 'crypto';
 
+/** IM remote mode context — injected into system prompt when message comes from an IM channel */
+export const IM_CONTEXT_PREFIX = `[IM 远程模式] 用户通过手机 IM 远程操作，无法访问本地屏幕和浏览器。
+规则：
+- 禁止使用 open 命令打开本地应用（浏览器、编辑器、Finder、Preview 等）
+- 需要用户预览内容时，生成文件（PDF/图片）并在输出中标注完整文件路径
+- 生成的文件会由桥接层自动发送到用户手机，无需额外操作
+- 长文档优先生成 PDF 或 Markdown 文件，手机阅读体验更好
+- 不要说"已保存到xxx，请查看"——用户看不到本地文件系统`;
+
+const IM_CHANNEL_TYPES = new Set([
+  'telegram',
+  'discord',
+  'slack',
+  'feishu',
+  'qq',
+]);
+
+/**
+ * Build the effective system prompt, optionally injecting IM context rules.
+ * Returns undefined if there is no prompt content.
+ */
+export function buildEffectiveSystemPrompt(
+  basePrompt: string | undefined | null,
+  channelType: string,
+): string | undefined {
+  let effective = basePrompt || '';
+  if (channelType && IM_CHANNEL_TYPES.has(channelType)) {
+    effective = effective
+      ? `${effective}\n\n${IM_CONTEXT_PREFIX}`
+      : IM_CONTEXT_PREFIX;
+  }
+  return effective || undefined;
+}
+
 export interface PermissionRequestInfo {
   permissionRequestId: string;
   toolName: string;
@@ -219,7 +253,10 @@ export async function processMessage(
       sessionId,
       sdkSessionId: binding.sdkSessionId || undefined,
       model: effectiveModel,
-      systemPrompt: session?.system_prompt || undefined,
+      systemPrompt: buildEffectiveSystemPrompt(
+        session?.system_prompt,
+        binding.channelType,
+      ),
       workingDirectory: binding.workingDirectory || session?.working_directory || undefined,
       abortController,
       permissionMode,

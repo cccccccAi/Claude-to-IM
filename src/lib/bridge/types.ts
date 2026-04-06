@@ -68,6 +68,14 @@ export interface OutboundMessage {
   inlineButtons?: InlineButton[][];
   /** If replying to a specific message */
   replyToMessageId?: string;
+  /** File attachments to send alongside the message */
+  attachments?: OutboundAttachment[];
+}
+
+/** Outbound file attachment (detected from Claude's response) */
+export interface OutboundAttachment {
+  filePath: string;
+  isImage: boolean;
 }
 
 /** Inline keyboard button for permission prompts */

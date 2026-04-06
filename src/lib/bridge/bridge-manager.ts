@@ -27,8 +27,378 @@ import {
   sanitizeInput,
   validateMode,
 } from './security/validators.js';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
+import * as readline from 'readline';
+import { sendImage, sendFile } from './adapters/feishu-file-capabilities.js';
 
 const GLOBAL_KEY = '__bridge_manager__';
+
+// ── B3: File path detection helpers ──────────────────────────────
+
+const FILE_EXTENSIONS =
+  '(pdf|png|jpg|jpeg|gif|xlsx|docx|pptx|html|md|csv|svg|webp)';
+
+/** Check if a file path is safe to send (not in sensitive dirs/names). */
+export function isPathSafe(filePath: string): boolean {
+  const resolved = path.resolve(filePath);
+  const home = os.homedir();
+  const BLOCKED_PREFIXES = [
+    path.join(home, '.ssh'),
+    path.join(home, '.aws'),
+    path.join(home, '.gnupg'),
+    path.join(home, '.kube'),
+    path.join(home, '.docker'),
+    '/etc/',
+  ];
+  if (BLOCKED_PREFIXES.some((p) => resolved.startsWith(p))) return false;
+  const BLOCKED_NAMES = [
+    '.env',
+    'credentials',
+    'id_rsa',
+    'id_ed25519',
+    '.netrc',
+  ];
+  if (BLOCKED_NAMES.some((n) => path.basename(resolved).includes(n)))
+    return false;
+  const dangerCheck = isDangerousInput(filePath);
+  if (dangerCheck.dangerous) return false;
+  return true;
+}
+
+/** Check if a file path refers to an image by extension. */
+export function isImageFile(filePath: string): boolean {
+  const ext = path.extname(filePath).slice(1).toLowerCase();
+  return [
+    'png',
+    'jpg',
+    'jpeg',
+    'gif',
+    'bmp',
+    'webp',
+    'svg',
+    'tiff',
+    'heic',
+  ].includes(ext);
+}
+
+/** Extract local file paths mentioned in Claude's response text. */
+export function extractLocalFilePaths(text: string): string[] {
+  const patterns = [
+    new RegExp(
+      `(?:保存到|saved to|wrote to|created|generated|生成)\\s+(?:文件\\s*)?[\`"]?([~/\\\\/][^\\s\`"\\n]{1,256}\\.${FILE_EXTENSIONS})[\`"]?`,
+      'gi',
+    ),
+    new RegExp(
+      `(?:文件|file|output)[\\s:：]*[\`"]?([~/\\\\/][^\\s\`"\\n]{1,256}\\.${FILE_EXTENSIONS})[\`"]?`,
+      'gi',
+    ),
+    new RegExp(
+      `^\\s*[-*]?\\s*[\`"]?(\\/[^\\s\`"\\n]{1,256}\\.${FILE_EXTENSIONS})[\`"]?\\s*$`,
+      'gmi',
+    ),
+  ];
+  const candidates = new Set<string>();
+  for (const pattern of patterns) {
+    for (const match of text.matchAll(pattern)) {
+      let fp = match[1].replace(/[.。,，;；）)】\]]+$/, '');
+      if (fp.startsWith('~')) fp = fp.replace('~', os.homedir());
+      candidates.add(fp);
+    }
+  }
+  return [...candidates].filter((fp) => {
+    try {
+      if (!isPathSafe(fp)) return false;
+      const stat = fs.statSync(fp);
+      if (!stat.isFile()) return false;
+      if (stat.size > 30 * 1024 * 1024) {
+        console.warn(
+          `[bridge] File too large for auto-send: ${fp} (${(stat.size / 1024 / 1024).toFixed(1)}MB)`,
+        );
+        return false;
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  });
+}
+
+// ── C1: /cwd --new argument parsing ──────────────────────────────
+
+/** Parse /cwd args, extracting path and --new flag. */
+export function parseCwdArgs(args: string): {
+  path: string;
+  hasNew: boolean;
+} {
+  const hasNew = /\s+--new\s*$/.test(args) || /^--new\s+/.test(args);
+  const pathArg = args
+    .replace(/\s+--new\s*$/, '')
+    .replace(/^--new\s+/, '')
+    .trim();
+  return { path: pathArg, hasNew };
+}
+
+// ── C2: Session scanning helpers ─────────────────────────────────
+
+/** Convert an absolute path to Claude's project directory name format. */
+export function pathToProjectDir(absPath: string): string {
+  return absPath.replace(/\//g, '-');
+}
+
+export interface SessionInfo {
+  id: string;
+  lastModified: Date;
+  size: number;
+  summary: string;
+}
+
+/**
+ * Scan Claude Code session files for a given working directory.
+ * @param workDir - the working directory to scan for
+ * @param projectDirOverride - override the project directory path (for testing)
+ */
+export async function scanClaudeSessions(
+  workDir: string,
+  projectDirOverride?: string,
+): Promise<SessionInfo[]> {
+  const projectDir =
+    projectDirOverride ||
+    path.join(os.homedir(), '.claude/projects', pathToProjectDir(workDir));
+  try {
+    const files = fs.readdirSync(projectDir);
+    const sessions: SessionInfo[] = [];
+    for (const file of files) {
+      if (!file.endsWith('.jsonl')) continue;
+      try {
+        const sessionId = file.replace('.jsonl', '');
+        const fp = path.join(projectDir, file);
+        const stat = fs.statSync(fp);
+        const summary = await readFirstUserMessage(fp);
+        sessions.push({
+          id: sessionId,
+          lastModified: stat.mtime,
+          size: stat.size,
+          summary,
+        });
+      } catch (fileErr) {
+        console.warn(
+          `[bridge-manager] Failed to read session ${file}:`,
+          fileErr,
+        );
+      }
+    }
+    return sessions.sort(
+      (a, b) => b.lastModified.getTime() - a.lastModified.getTime(),
+    );
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw err;
+  }
+}
+
+/** Read the first meaningful user message from a Claude session JSONL file. */
+export async function readFirstUserMessage(filePath: string): Promise<string> {
+  const fileStream = fs.createReadStream(filePath, { encoding: 'utf-8' });
+  const lines = readline.createInterface({ input: fileStream });
+  try {
+    for await (const line of lines) {
+      try {
+        const entry = JSON.parse(line);
+        if (entry.type === 'user' && entry.message?.content) {
+          let text = '';
+          if (typeof entry.message.content === 'string') {
+            text = entry.message.content;
+          } else if (Array.isArray(entry.message.content)) {
+            text = entry.message.content
+              .filter((b: { type: string }) => b.type === 'text')
+              .map((b: { text: string }) => b.text)
+              .join(' ');
+          }
+          // Skip queue-operation entries
+          if (text.startsWith('queue-operation')) continue;
+          lines.close();
+          return text.slice(0, 80).replace(/\n/g, ' ').trim() || '[empty]';
+        }
+      } catch {
+        /* skip malformed lines */
+      }
+    }
+    return '[no user message]';
+  } catch {
+    return '[error]';
+  } finally {
+    lines.close();
+    fileStream.destroy();
+  }
+}
+
+// ── C3: /resume target resolution ────────────────────────────────
+
+/** Resolve the target session ID for /resume command. Pure logic, no side effects. */
+export function resolveResumeTarget(
+  args: string,
+  cachedSessions: SessionInfo[] | null,
+): { sessionId: string | null; error?: string } {
+  // Pure numeric → index from cache
+  if (/^\d+$/.test(args)) {
+    if (!cachedSessions || cachedSessions.length === 0) {
+      return { sessionId: null, error: '请先执行 /sessions 获取会话列表' };
+    }
+    const idx = parseInt(args) - 1;
+    if (idx < 0 || idx >= cachedSessions.length) {
+      return {
+        sessionId: null,
+        error: `序号超出范围（1-${cachedSessions.length}）`,
+      };
+    }
+    return { sessionId: cachedSessions[idx].id };
+  }
+  // Full UUID format
+  if (validateSessionId(args)) {
+    return { sessionId: args };
+  }
+  // Short prefix match
+  if (!cachedSessions || cachedSessions.length === 0) {
+    return { sessionId: null, error: '请先执行 /sessions 获取会话列表' };
+  }
+  const matches = cachedSessions.filter((s) => s.id.startsWith(args));
+  if (matches.length === 0) {
+    return {
+      sessionId: null,
+      error: `未找到前缀为 "${escapeHtml(args)}" 的会话`,
+    };
+  }
+  if (matches.length > 1) {
+    const list = matches
+      .slice(0, 5)
+      .map((s) => `<code>${s.id.slice(0, 12)}...</code>`)
+      .join(', ');
+    return {
+      sessionId: null,
+      error: `匹配到 ${matches.length} 个会话，请更精确：${list}`,
+    };
+  }
+  return { sessionId: matches[0].id };
+}
+
+/** Format a Date as a relative time string. */
+function formatTimeAgo(date: Date): string {
+  const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
+  if (seconds < 60) return '刚刚';
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}分钟前`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}小时前`;
+  if (seconds < 604800) return `${Math.floor(seconds / 86400)}天前`;
+  return date.toLocaleDateString('zh-CN');
+}
+
+// Sessions cache for /resume command (binding.id → last session list)
+const sessionsCache = new Map<string, SessionInfo[]>();
+
+// Projects cache for /cwd <number> command
+let projectsCache: string[] = [];
+
+// Session aliases: keyed by codepilotSessionId → user-defined name.
+// Persisted to ~/.claude-to-im/data/aliases.json for restart survival.
+const sessionAliases = new Map<string, string>();
+
+const ALIASES_FILE = path.join(os.homedir(), '.claude-to-im', 'data', 'aliases.json');
+
+function loadAliases(): void {
+  try {
+    const raw = fs.readFileSync(ALIASES_FILE, 'utf8');
+    const obj = JSON.parse(raw) as Record<string, string>;
+    for (const [k, v] of Object.entries(obj)) {
+      if (typeof k === 'string' && typeof v === 'string') {
+        sessionAliases.set(k, v);
+      }
+    }
+  } catch {
+    // File doesn't exist yet — ok
+  }
+}
+
+function saveAliases(): void {
+  try {
+    fs.writeFileSync(ALIASES_FILE, JSON.stringify(Object.fromEntries(sessionAliases), null, 2), 'utf8');
+  } catch (err) {
+    console.warn('[bridge-manager] Failed to save aliases:', err instanceof Error ? err.message : err);
+  }
+}
+
+
+/**
+ * Decode a Claude project directory name back to an absolute path.
+ * Encoding is lossy (/ → - but - also exists in dir names), so we verify
+ * against the filesystem. Tries progressively shorter prefix matches.
+ */
+export function decodeProjectDir(encoded: string): string | null {
+  // encoded: "-Users-aocai-AI-skill-hub" → should be "/Users/aocai/AI/skill-hub"
+  // Strategy: start from left, greedily match filesystem directories
+  const parts = encoded.slice(1).split('-'); // remove leading -, split by -
+  let current = '';
+  let result = '/';
+
+  for (let i = 0; i < parts.length; i++) {
+    const candidate = current ? `${current}-${parts[i]}` : parts[i];
+    const asDir = result + candidate;
+
+    if (fs.existsSync(asDir)) {
+      // This segment exists as a directory, commit it
+      result = asDir + '/';
+      current = '';
+    } else if (i < parts.length - 1) {
+      // Doesn't exist yet, might be part of a hyphenated name
+      current = candidate;
+    } else {
+      // Last part: commit whatever we have
+      result = result + candidate;
+      current = '';
+    }
+  }
+
+  if (current) {
+    result = result + current;
+  }
+
+  // Remove trailing /
+  result = result.replace(/\/$/, '');
+
+  // Verify the decoded path actually exists
+  return fs.existsSync(result) ? result : null;
+}
+
+/**
+ * List all known project directories from ~/.claude/projects/.
+ * Returns decoded absolute paths sorted by directory mtime (most recent first).
+ */
+export function listKnownProjects(): string[] {
+  const projectsRoot = path.join(os.homedir(), '.claude/projects');
+  try {
+    const entries = fs.readdirSync(projectsRoot, { withFileTypes: true });
+    const projects: { absPath: string; mtime: number }[] = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      if (!entry.name.startsWith('-')) continue; // must start with -
+      const absPath = decodeProjectDir(entry.name);
+      if (!absPath) continue; // couldn't decode or path doesn't exist
+      try {
+        const stat = fs.statSync(path.join(projectsRoot, entry.name));
+        projects.push({ absPath, mtime: stat.mtimeMs });
+      } catch { continue; }
+    }
+    return projects
+      .sort((a, b) => b.mtime - a.mtime)
+      .map((p) => p.absPath);
+  } catch {
+    return [];
+  }
+}
+
+// ── Previous SDK Session ID storage (for /back command) ─────
+// Keyed by binding.id → previous sdkSessionId before /new cleared it.
+const previousSdkSessionIds = new Map<string, string>();
 
 // ── Streaming preview helpers ──────────────────────────────────
 
@@ -219,6 +589,9 @@ function processWithSessionLock(sessionId: string, fn: () => Promise<void>): Pro
 export async function start(): Promise<void> {
   const state = getState();
   if (state.running) return;
+
+  // Load persisted aliases before processing any messages
+  loadAliases();
 
   const { store, lifecycle } = getBridgeContext();
 
@@ -725,7 +1098,36 @@ async function handleMessage(
     // Skip if streaming card was finalized (content already in card).
     if (result.responseText) {
       if (!cardFinalized) {
-        await deliverResponse(adapter, msg.address, result.responseText, binding.codepilotSessionId, msg.messageId);
+        const alias = sessionAliases.get(binding.codepilotSessionId);
+        const responseToSend = alias
+          ? `📌 ${alias}\n\n${result.responseText}`
+          : result.responseText;
+        await deliverResponse(adapter, msg.address, responseToSend, binding.codepilotSessionId, msg.messageId);
+
+        // Auto-detect and send files mentioned in Claude's response
+        if (adapter.channelType === 'feishu') {
+          const filePaths = extractLocalFilePaths(result.responseText);
+          const feishuClient = (
+            adapter as unknown as { getLarkClient(): unknown }
+          ).getLarkClient();
+          if (feishuClient) {
+            for (const fp of filePaths) {
+              try {
+                if (isImageFile(fp)) {
+                  await sendImage(feishuClient, msg.address.chatId, fp);
+                } else {
+                  await sendFile(feishuClient, msg.address.chatId, fp);
+                }
+              } catch (err) {
+                await deliver(adapter, {
+                  address: msg.address,
+                  text: `File auto-send failed: ${path.basename(fp)}. Use /send ${fp} to retry`,
+                  parseMode: 'plain',
+                });
+              }
+            }
+          }
+        }
       }
     } else if (result.hasError) {
       const errorResponse: OutboundMessage = {
@@ -813,23 +1215,21 @@ async function handleCommand(
   switch (command) {
     case '/start':
       response = [
-        '<b>CodePilot Bridge</b>',
+        '<b>🤖 Claude Bridge</b>',
         '',
-        'Send any message to interact with Claude.',
+        '直接发消息即可与 Claude 对话。',
         '',
-        '<b>Commands:</b>',
-        '/new [path] - Start new session',
-        '/bind &lt;session_id&gt; - Bind to existing session',
-        '/cwd /path - Change working directory',
-        '/mode plan|code|ask - Change mode',
-        '/status - Show current status',
-        '/sessions - List recent sessions',
-        '/stop - Stop current session',
-        '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission',
-        '/help - Show this help',
+        '<b>常用命令：</b>',
+        '/cwd — 查看/切换项目',
+        '/sessions — 查看历史会话',
+        '/resume &lt;序号&gt; — 恢复会话',
+        '/new — 新建会话',
+        '/name &lt;名称&gt; — 给会话命名',
+        '/help — 查看全部命令',
       ].join('\n');
       break;
 
+    case '/n':
     case '/new': {
       // Abort any running task on the current session before creating a new one
       const oldBinding = router.resolve(msg.address);
@@ -849,8 +1249,56 @@ async function handleCommand(
         }
         workDir = validated;
       }
+      // Save current sdkSessionId before clearing (for /back)
+      const oldBinding = router.resolve(msg.address);
+      if (oldBinding.sdkSessionId) {
+        previousSdkSessionIds.set(oldBinding.id, oldBinding.sdkSessionId);
+      }
       const binding = router.createBinding(msg.address, workDir);
+      // Explicitly clear sdkSessionId so the next message starts a fresh Claude session
+      router.updateBinding(binding.id, { sdkSessionId: '' });
       response = `New session created.\nSession: <code>${binding.codepilotSessionId.slice(0, 8)}...</code>\nCWD: <code>${escapeHtml(binding.workingDirectory || '~')}</code>`;
+      break;
+    }
+
+    case '/b':
+    case '/back': {
+      const binding = router.resolve(msg.address);
+      const prevId = previousSdkSessionIds.get(binding.id);
+      if (!prevId) {
+        response = '⚠️ 没有可恢复的历史会话（仅在本次 daemon 运行期间有效）';
+        break;
+      }
+      // Save current as previous before switching back
+      if (binding.sdkSessionId) {
+        previousSdkSessionIds.set(binding.id, binding.sdkSessionId);
+      }
+      router.updateBinding(binding.id, { sdkSessionId: prevId });
+      response = `✅ 已恢复到会话 <code>${prevId.slice(0, 8)}...</code>\n下一条消息将从该会话继续`;
+      break;
+    }
+
+    case '/r':
+    case '/resume': {
+      if (!args || !args.trim()) {
+        response = 'Usage: /resume &lt;number|ID prefix|full ID&gt;';
+        break;
+      }
+      const resumeBinding = router.resolve(msg.address);
+      const cached = sessionsCache.get(resumeBinding.id) || null;
+      const resumeResult = resolveResumeTarget(args.trim(), cached);
+      if (resumeResult.error) {
+        response = resumeResult.error;
+      } else if (resumeResult.sessionId) {
+        // Save current sdkSessionId for /back
+        if (resumeBinding.sdkSessionId) {
+          previousSdkSessionIds.set(resumeBinding.id, resumeBinding.sdkSessionId);
+        }
+        router.updateBinding(resumeBinding.id, {
+          sdkSessionId: resumeResult.sessionId,
+        });
+        response = `Resumed session <code>${resumeResult.sessionId.slice(0, 8)}...</code>`;
+      }
       break;
     }
 
@@ -873,18 +1321,65 @@ async function handleCommand(
     }
 
     case '/cwd': {
+      // No args → list known projects
       if (!args) {
-        response = 'Usage: /cwd /path/to/directory';
+        const projects = listKnownProjects();
+        if (projects.length === 0) {
+          response = '未找到任何项目目录';
+          break;
+        }
+        projectsCache = projects;
+        const binding = router.resolve(msg.address);
+        const currentCwd = binding.workingDirectory || '';
+        const lines = ['<b>📂 项目列表：</b>', ''];
+        for (let i = 0; i < Math.min(projects.length, 15); i++) {
+          const marker = projects[i] === currentCwd ? ' ◀' : '';
+          lines.push(`${i + 1}. <code>${escapeHtml(projects[i])}</code>${marker}`);
+        }
+        if (projects.length > 15) {
+          lines.push(`... 共 ${projects.length} 个项目`);
+        }
+        lines.push('', '用 /cwd &lt;序号&gt; 切换，/cwd &lt;序号&gt; --new 切换并新建会话');
+        response = lines.join('\n');
         break;
       }
-      const validatedPath = validateWorkingDirectory(args);
-      if (!validatedPath) {
-        response = 'Invalid path. Must be an absolute path without traversal sequences or special characters.';
-        break;
+
+      const { path: cwdPathArg, hasNew } = parseCwdArgs(args);
+
+      // Numeric → pick from cache
+      let targetPath: string;
+      if (/^\d+$/.test(cwdPathArg)) {
+        if (projectsCache.length === 0) {
+          response = '请先执行 /cwd 查看项目列表';
+          break;
+        }
+        const idx = parseInt(cwdPathArg) - 1;
+        if (idx < 0 || idx >= projectsCache.length) {
+          response = `序号超出范围（1-${projectsCache.length}）`;
+          break;
+        }
+        targetPath = projectsCache[idx];
+      } else {
+        // Absolute path
+        const validated = validateWorkingDirectory(cwdPathArg);
+        if (!validated) {
+          response = 'Invalid path. Must be an absolute path without traversal sequences or special characters.';
+          break;
+        }
+        targetPath = validated;
       }
+
       const binding = router.resolve(msg.address);
-      router.updateBinding(binding.id, { workingDirectory: validatedPath });
-      response = `Working directory set to <code>${escapeHtml(validatedPath)}</code>`;
+      router.updateBinding(binding.id, {
+        workingDirectory: targetPath,
+        sdkSessionId: '',
+      });
+      if (hasNew) {
+        router.createBinding(msg.address, targetPath);
+        response = `Working directory set to <code>${escapeHtml(targetPath)}</code>\nNew session created.`;
+      } else {
+        response = `Working directory set to <code>${escapeHtml(targetPath)}</code>\n(SDK session reset — next message starts fresh context)`;
+      }
       break;
     }
 
@@ -913,16 +1408,49 @@ async function handleCommand(
     }
 
     case '/sessions': {
-      const bindings = router.listBindings(adapter.channelType);
-      if (bindings.length === 0) {
-        response = 'No sessions found.';
-      } else {
-        const lines = ['<b>Sessions:</b>', ''];
-        for (const b of bindings.slice(0, 10)) {
-          const active = b.active ? 'active' : 'inactive';
-          lines.push(`<code>${b.codepilotSessionId.slice(0, 8)}...</code> [${active}] ${escapeHtml(b.workingDirectory || '~')}`);
+      const sessBinding = router.resolve(msg.address);
+      const workDir = args || sessBinding.workingDirectory;
+
+      if (workDir) {
+        // Scan Claude Code history sessions
+        const sessions = await scanClaudeSessions(workDir);
+        if (sessions.length === 0) {
+          response = `📂 ${escapeHtml(workDir)} 下无历史会话`;
+        } else {
+          sessionsCache.set(sessBinding.id, sessions);
+          const lines = [
+            `<b>📂 ${escapeHtml(workDir)} 历史会话：</b>`,
+            '',
+          ];
+          const activeSdkId = sessBinding.sdkSessionId;
+          const activeAlias = sessionAliases.get(sessBinding.codepilotSessionId);
+          for (let i = 0; i < Math.min(sessions.length, 10); i++) {
+            const s = sessions[i];
+            const ago = formatTimeAgo(s.lastModified);
+            const isActive = activeSdkId && s.id === activeSdkId;
+            const activeTag = isActive ? (activeAlias ? ` 📌 ${escapeHtml(activeAlias)}` : ' ◀ 当前') : '';
+            lines.push(
+              `${i + 1}. "${escapeHtml(s.summary)}" (${ago})${activeTag}`,
+            );
+          }
+          lines.push('', '用 /resume &lt;序号&gt; 恢复，/name 给当前会话命名');
+          response = lines.join('\n');
         }
-        response = lines.join('\n');
+      } else {
+        // No working directory — fallback to listing bindings
+        const bindings = router.listBindings(adapter.channelType);
+        if (bindings.length === 0) {
+          response = 'No sessions found.';
+        } else {
+          const lines = ['<b>Sessions:</b>', ''];
+          for (const b of bindings.slice(0, 10)) {
+            const active = b.active ? 'active' : 'inactive';
+            lines.push(
+              `<code>${b.codepilotSessionId.slice(0, 8)}...</code> [${active}] ${escapeHtml(b.workingDirectory || '~')}`,
+            );
+          }
+          response = lines.join('\n');
+        }
       }
       break;
     }
@@ -961,19 +1489,98 @@ async function handleCommand(
       break;
     }
 
+    case '/send': {
+      if (!args) {
+        response = 'Usage: /send /path/to/file';
+        break;
+      }
+      const sendFilePath = args.trim();
+      if (!isPathSafe(sendFilePath)) {
+        response =
+          'Safety restriction: sending files from this path is not allowed.';
+        break;
+      }
+      try {
+        const stat = fs.statSync(sendFilePath);
+        if (!stat.isFile()) {
+          response = 'Path is not a file.';
+          break;
+        }
+        if (stat.size > 30 * 1024 * 1024) {
+          response = `File ${path.basename(sendFilePath)} (${(stat.size / 1024 / 1024).toFixed(1)}MB) exceeds 30MB limit`;
+          break;
+        }
+        if (adapter.channelType === 'feishu') {
+          const feishuClient = (adapter as unknown as { getLarkClient(): unknown }).getLarkClient();
+          if (!feishuClient) {
+            response = 'Feishu client not initialized.';
+            break;
+          }
+          let sendResult;
+          if (isImageFile(sendFilePath)) {
+            sendResult = await sendImage(
+              feishuClient,
+              msg.address.chatId,
+              sendFilePath,
+            );
+          } else {
+            sendResult = await sendFile(
+              feishuClient,
+              msg.address.chatId,
+              sendFilePath,
+            );
+          }
+          response = sendResult.ok
+            ? `Sent ${path.basename(sendFilePath)}`
+            : `Send failed: ${sendResult.error}`;
+        } else {
+          response = 'File sending is currently only supported for Feishu.';
+        }
+      } catch {
+        response = `File not found: ${sendFilePath}`;
+      }
+      break;
+    }
+
+    case '/name': {
+      if (!args) {
+        response = '用法：/name 会话名称';
+        break;
+      }
+      const nameBinding = router.resolve(msg.address);
+      sessionAliases.set(nameBinding.codepilotSessionId, args.trim());
+      saveAliases();
+      response = `✅ 当前会话已命名为「${escapeHtml(args.trim())}」`;
+      break;
+    }
+
     case '/help':
       response = [
-        '<b>CodePilot Bridge Commands</b>',
+        '<b>📋 命令帮助</b>',
         '',
-        '/new [path] - Start new session',
-        '/bind &lt;session_id&gt; - Bind to existing session',
-        '/cwd /path - Change working directory',
-        '/mode plan|code|ask - Change mode',
-        '/status - Show current status',
-        '/sessions - List recent sessions',
-        '/stop - Stop current session',
-        '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission request',
-        '1/2/3 - Quick permission reply (Feishu/QQ/WeChat, single pending)',
+        '<b>会话管理</b>',
+        '/new (/n) — 新建会话',
+        '/sessions — 查看历史会话列表',
+        '/resume (/r) &lt;序号&gt; — 恢复指定会话',
+        '/back (/b) — 返回上一个会话',
+        '/name &lt;名称&gt; — 给当前会话命名',
+        '/stop — 停止当前任务',
+        '',
+        '<b>项目切换</b>',
+        '/cwd — 查看项目列表',
+        '/cwd &lt;序号&gt; — 切换到指定项目',
+        '/cwd &lt;序号&gt; --new — 切换项目并新建会话',
+        '',
+        '<b>设置</b>',
+        '/mode plan|code|ask — 切换模式',
+        '/status — 查看当前状态',
+        '',
+        '<b>文件</b>',
+        '/send &lt;路径&gt; — 发送本地文件到聊天',
+        '',
+        '<b>权限</b>',
+        '/perm allow|deny &lt;id&gt; — 批准/拒绝权限请求',
+        '1/2/3 - 快捷权限回复 (Feishu/QQ/WeChat)',
         '/help - Show this help',
       ].join('\n');
       break;
